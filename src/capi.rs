@@ -300,8 +300,9 @@ unsafe fn to_action(mv: Obj) -> Option<u8> {
             let kind = str_of((api().PyTuple_GetItem)(mv, 0));
             let a = int_of((api().PyTuple_GetItem)(mv, 1));
             let b = if n == 3 { int_of((api().PyTuple_GetItem)(mv, 2)) } else { Some(0) };
-            if let (Some(kind), Some(a), Some(b)) = (kind, a, b) {
-                let (a, b) = (a.clamp(0, 255) as u8, b.clamp(0, 255) as u8);
+            // 負の値や 256 以上は u8 に変換できない → 不正な手として扱う
+            let ab = a.zip(b).and_then(|(a, b)| Some((u8::try_from(a).ok()?, u8::try_from(b).ok()?)));
+            if let (Some(kind), Some((a, b))) = (kind, ab) {
                 let m = match (kind, n) {
                     ("move", 2) => Some(Move::Pawn(a)),
                     ("hwall", 3) => Some(Move::HWall(a, b)),
@@ -455,7 +456,25 @@ type FastKw = unsafe extern "C" fn(Obj, *const Obj, Ssize, Obj) -> Obj;
 type NoArgs = unsafe extern "C" fn(Obj, Obj) -> Obj;
 type OneArg = unsafe extern "C" fn(Obj, Obj) -> Obj;
 
+/// 壁の残数がない・既存の壁と重なる／交差する壁か（Board::make に渡すと盤面が壊れる手）
+fn breaks_board(b: &Board, a: u8) -> bool {
+    if a < HWALL_BASE {
+        return false;
+    }
+    if b.walls[b.turn as usize] == 0 {
+        return true;
+    }
+    let (vh, vv) = b.valid_wall_masks();
+    if a < VWALL_BASE {
+        (vh >> (a - HWALL_BASE)) & 1 == 0
+    } else {
+        (vv >> (a - VWALL_BASE)) & 1 == 0
+    }
+}
+
 /// make_move(move, check=True)
+///
+/// check=False は経路の確認（BFS）などを省くが、盤面が壊れる手（breaks_board）は常に弾く。
 unsafe extern "C" fn m_make_move(o: Obj, args: *const Obj, nargs: Ssize, kw: Obj) -> Obj {
     let Some(mv) = arg(args, nargs, kw, 0, "move") else {
         return raise(api().exc_type_error, "make_move() missing argument: move");
@@ -463,7 +482,8 @@ unsafe extern "C" fn m_make_move(o: Obj, args: *const Obj, nargs: Ssize, kw: Obj
     let Some(a) = to_action(mv) else { return null_mut() };
     let Some(check) = bool_arg(arg(args, nargs, kw, 1, "check"), true) else { return null_mut() };
     let b = board(o);
-    if check && !b.is_legal(a) {
+    let rejected = if check { !b.is_legal(a) } else { breaks_board(b, a) };
+    if rejected {
         let desc = match decode_action(a) {
             Some(Move::Pawn(n)) => format!("('move', {n})"),
             Some(Move::HWall(x, y)) => format!("('hwall', {x}, {y})"),
@@ -628,10 +648,12 @@ unsafe extern "C" fn m_search(o: Obj, args: *const Obj, nargs: Ssize, kw: Obj) -
     }
     if let Some(t) = time_arg {
         let ms = (api().PyFloat_AsDouble)(t);
-        if !(api().PyErr_Occurred)().is_null() || !(ms > 0.0) {
-            return raise(api().exc_value_error, "time_ms must be a positive number");
-        }
-        lim.time = Some(Duration::from_secs_f64(ms / 1000.0));
+        // inf や巨大な値は Duration にできない（from_secs_f64 はパニックする）
+        let time = Duration::try_from_secs_f64(ms / 1000.0).ok().filter(|_| ms > 0.0);
+        let Some(time) = time.filter(|_| (api().PyErr_Occurred)().is_null()) else {
+            return raise(api().exc_value_error, "time_ms must be a positive finite number");
+        };
+        lim.time = Some(time);
         if depth_arg.is_none() {
             lim.max_depth = 60;
         }
@@ -840,7 +862,7 @@ macro_rules! getter {
 const FK: c_int = METH_FASTCALL | METH_KEYWORDS;
 
 static METHODS: [PyMethodDef; 25] = [
-    meth!("make_move", m_make_move as FastKw, FK, "make_move(move, check=True)\n--\n\n手を指す。check=True なら非合法手で ValueError。"),
+    meth!("make_move", m_make_move as FastKw, FK, "make_move(move, check=True)\n--\n\n手を指す。check=True なら非合法手で ValueError。check=False でも、残数のない壁と重なる壁は ValueError。"),
     meth!("undo_move", m_undo_move as NoArgs, METH_NOARGS, "直前の手（パスを含む）を取り消す。取り消す手がなければ False。"),
     meth!("make_pass", m_make_pass as NoArgs, METH_NOARGS, "パス（ヌルムーブ）。undo_move で取り消せる。"),
     meth!("is_legal", m_is_legal as OneArg, METH_O, "手が合法か。"),

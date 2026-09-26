@@ -7,6 +7,8 @@
 //!   - 壁の手順付けで向きを取り違えていたバグ（"hwall" を 'h' と比較していた）を修正
 //!   - 複数スレッド（置換表を共有し、各スレッドが同じ局面を探索する Lazy SMP）
 //!   - 時間制限（反復深化の途中で打ち切り、最後に完了した深さの手を返す）
+//!   - 壁の候補の範囲: 相手に並ばれた・追い越された後は相手のゴール側も含める（wall_rows）
+//!   - history に上限を設ける（HISTORY_MAX。長い探索でキラー手や前回の最善手を追い越さないように）
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,6 +28,9 @@ const NMP_WALL_MIN: u8 = 2;
 /// Python 版の 30.0 に相当
 const ASPIRATION_WINDOW: i32 = 3000;
 const MAX_RETRIES: u32 = 5;
+/// history がこれを超えたら全体を半分にする。並べ替えキーでキラー手（800_000〜）や
+/// ルートの前回の最善手（1_000_000）を追い越さないよう、50_000 + history を十分小さく保つ。
+const HISTORY_MAX: i32 = 1 << 16;
 
 /// 前方の壁（行マスク）: P0 は y >= row - 1、P1 は y <= row
 const FORWARD: [[u64; 9]; 2] = {
@@ -72,7 +77,22 @@ const NEAR: [u64; 81] = {
     t
 };
 
-/// 探索用に絞り込んだ壁（両者の最短経路を切る、手番側から見て前方の合法な壁）と、その計算に使った切断マスク
+/// 壁の候補を探す範囲（行マスク）: 手番側から見て前方。
+///
+/// 相手に並ばれた・追い越された後は、前方だけでは相手のゴール前の壁が入らないので、
+/// 相手から見て前方（相手の経路の残り）も加える。
+fn wall_rows(b: &Board, me: usize) -> u64 {
+    let (my_row, en_row) = ((b.pos[me] / 9) as usize, (b.pos[me ^ 1] / 9) as usize);
+    let passed = if me == 0 { en_row <= my_row } else { en_row >= my_row };
+    let fwd = FORWARD[me][my_row];
+    if passed {
+        fwd | FORWARD[me ^ 1][en_row]
+    } else {
+        fwd
+    }
+}
+
+/// 探索用に絞り込んだ壁（両者の最短経路を切る、wall_rows の範囲の合法な壁）と、その計算に使った切断マスク
 fn candidate_walls(b: &Board) -> Option<((u64, u64), [(u64, u64); 2])> {
     crate::stat!(CANDIDATES);
     let me = b.turn as usize;
@@ -81,7 +101,7 @@ fn candidate_walls(b: &Board) -> Option<((u64, u64), [(u64, u64); 2])> {
     }
     let c0 = b.path_cut_masks(0)?;
     let c1 = b.path_cut_masks(1)?;
-    let fwd = FORWARD[me][(b.pos[me] / 9) as usize];
+    let fwd = wall_rows(b, me);
     let walls = b.legal_wall_masks_restricted((c0.0 | c1.0) & fwd, (c0.1 | c1.1) & fwd);
     Some((walls, [c0, c1]))
 }
@@ -236,7 +256,7 @@ impl Worker<'_> {
         }
         let c0 = self.cuts(b, 0)?;
         let c1 = self.cuts(b, 1)?;
-        let fwd = FORWARD[me][(b.pos[me] / 9) as usize];
+        let fwd = wall_rows(b, me);
         let walls = b.legal_wall_masks_restricted((c0.0 | c1.0) & fwd, (c0.1 | c1.1) & fwd);
         Some((walls, [c0, c1]))
     }
@@ -326,7 +346,13 @@ impl Worker<'_> {
                     k[1] = k[0];
                     k[0] = $mv;
                 }
-                self.st.history[$mv as usize] += depth * depth;
+                let h = &mut self.st.history[$mv as usize];
+                *h += depth * depth;
+                if *h > HISTORY_MAX {
+                    for h in self.st.history.iter_mut() {
+                        *h >>= 1;
+                    }
+                }
                 self.tt.store(key, self.gen, d8, LOWER, best, best_mv);
                 return best;
             }};
@@ -749,7 +775,8 @@ impl Searcher {
         }
 
         let shared = Shared { stop: AtomicBool::new(false), best: Mutex::new((0, NO_MOVE, 0)) };
-        let deadline = limits.time.map(|t| start + t);
+        // 桁あふれするほど長い時間は制限なしとみなす
+        let deadline = limits.time.and_then(|t| start.checked_add(t));
         let max_depth = limits.max_depth.clamp(1, MAX_DEPTH as u32 - 2);
         let (tt, gen) = (&*self.tt, self.gen);
         let (main_state, helper_states) = self.states[..threads].split_first_mut().unwrap();
@@ -811,4 +838,43 @@ pub fn perft_parallel(board: &Board, depth: u32, threads: usize, bulk: bool) -> 
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).sum()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_walls_after_passing() {
+        // P0 は 6 行目、P1 は 2 行目（追い越された後）。P1 のゴール前（y <= 1）の壁も候補に入る
+        let b = Board::from_parts([58, 22], [10, 10], 0, 0, 0);
+        let ((h, _), _) = candidate_walls(&b).unwrap();
+        assert_ne!(h & 0xFFFF, 0, "P1 のゴール前の水平壁が候補にない: {h:#x}");
+        // 追い越す前は従来どおり前方だけ
+        let b = Board::from_parts([22, 58], [10, 10], 0, 0, 0);
+        let ((h, v), _) = candidate_walls(&b).unwrap();
+        assert_eq!((h | v) & 0xFF, 0);
+    }
+
+    #[test]
+    fn history_stays_bounded() {
+        let mut b = Board::new();
+        for a in [13, 67, 22, 58] {
+            b.make(a);
+        }
+        let mut s = Searcher::new(16);
+        let lim = Limits { max_depth: 60, time: Some(Duration::from_millis(300)), threads: 1 };
+        for _ in 0..3 {
+            s.search(&b, &lim);
+        }
+        let max = s.states[0].history.iter().copied().max().unwrap();
+        assert!(max <= HISTORY_MAX, "{max}");
+    }
+
+    #[test]
+    fn huge_time_limit_does_not_panic() {
+        let b = Board::new();
+        let r = Searcher::new(1).search(&b, &Limits { max_depth: 2, time: Some(Duration::MAX), threads: 1 });
+        assert!(b.is_legal(r.best.unwrap()));
+    }
 }
