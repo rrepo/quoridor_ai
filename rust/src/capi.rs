@@ -15,6 +15,12 @@ use std::ptr::{self, null, null_mut};
 
 use crate::board::{decode_action, encode_move as encode, Board, Move};
 use crate::consts::{ACTION_COUNT, HWALL_BASE, MAX_WALLS, VWALL_BASE};
+use crate::search::{perft_parallel, Limits, Searcher};
+use std::sync::Mutex;
+use std::time::Duration;
+
+/// Board.search が使う探索器（置換表などを呼び出し間で持ち越す。Python 版のモジュール変数と同じ扱い）
+static SEARCHER: Mutex<Option<Searcher>> = Mutex::new(None);
 
 type Obj = *mut c_void;
 type Ssize = isize;
@@ -162,6 +168,8 @@ py_api! {
     fn PyNumber_Lshift(Obj, Obj) -> Obj;
     fn PyNumber_Or(Obj, Obj) -> Obj;
     fn PyBool_FromLong(c_long) -> Obj;
+    fn PyFloat_FromDouble(f64) -> Obj;
+    fn PyFloat_AsDouble(Obj) -> f64;
     fn PyObject_IsTrue(Obj) -> c_int;
     fn PyTuple_New(Ssize) -> Obj;
     fn PyTuple_SetItem(Obj, Ssize, Obj) -> c_int;
@@ -593,11 +601,64 @@ unsafe extern "C" fn m_perft(o: Obj, args: *const Obj, nargs: Ssize, kw: Obj) ->
         None => return raise(api().exc_type_error, "depth must be an int"),
     };
     let Some(bulk) = bool_arg(arg(args, nargs, kw, 1, "bulk"), false) else { return null_mut() };
-    let mut b = board(o).clone();
+    let threads = match arg(args, nargs, kw, 2, "threads") {
+        None => 1,
+        Some(t) => match int_of(t) {
+            Some(v @ 1..=256) => v as usize,
+            _ => return raise(api().exc_value_error, "threads must be 1..256"),
+        },
+    };
+    let b = board(o).clone();
     let ts = (api().PyEval_SaveThread)();
-    let n = if bulk { b.perft_bulk(depth) } else { b.perft(depth) };
+    let n = perft_parallel(&b, depth, threads, bulk);
     (api().PyEval_RestoreThread)(ts);
     (api().PyLong_FromUnsignedLongLong)(n)
+}
+
+/// search(depth=4, time_ms=None, threads=1) -> (最善手 or None, 評価値, 完了した深さ, ノード数)
+unsafe extern "C" fn m_search(o: Obj, args: *const Obj, nargs: Ssize, kw: Obj) -> Obj {
+    let depth_arg = arg(args, nargs, kw, 0, "depth");
+    let time_arg = arg(args, nargs, kw, 1, "time_ms").filter(|&t| t != api().none);
+    let mut lim = Limits { max_depth: 4, time: None, threads: 1 };
+    if let Some(d) = depth_arg {
+        match int_of(d) {
+            Some(v @ 1..=60) => lim.max_depth = v as u32,
+            _ => return raise(api().exc_value_error, "depth must be 1..60"),
+        }
+    }
+    if let Some(t) = time_arg {
+        let ms = (api().PyFloat_AsDouble)(t);
+        if !(api().PyErr_Occurred)().is_null() || !(ms > 0.0) {
+            return raise(api().exc_value_error, "time_ms must be a positive number");
+        }
+        lim.time = Some(Duration::from_secs_f64(ms / 1000.0));
+        if depth_arg.is_none() {
+            lim.max_depth = 60;
+        }
+    }
+    if let Some(t) = arg(args, nargs, kw, 2, "threads") {
+        match int_of(t) {
+            Some(v @ 1..=256) => lim.threads = v as usize,
+            _ => return raise(api().exc_value_error, "threads must be 1..256"),
+        }
+    }
+    let b = board(o).clone();
+    let ts = (api().PyEval_SaveThread)();
+    let r = {
+        let mut g = SEARCHER.lock().unwrap_or_else(|e| e.into_inner());
+        g.get_or_insert_with(|| Searcher::new(64)).search(&b, &lim)
+    };
+    (api().PyEval_RestoreThread)(ts);
+    let mv = match r.best {
+        Some(a) => move_tuple(a),
+        None => none(),
+    };
+    py_tuple(&[
+        mv,
+        (api().PyFloat_FromDouble)(r.score as f64 / 100.0),
+        py_int(r.depth as i64),
+        (api().PyLong_FromUnsignedLongLong)(r.nodes),
+    ])
 }
 
 /// NN 入力用: (4, 9, 9) の float32 を bytes で返す（自分の駒・相手の駒・横壁・縦壁）
@@ -732,6 +793,16 @@ unsafe extern "C" fn f_encode_move(_: Obj, mv: Obj) -> Obj {
     }
 }
 
+/// Board.search の置換表・キラー手・history を消す（Python 版 clear_tt に相当）
+unsafe extern "C" fn f_clear_search(_: Obj, _: Obj) -> Obj {
+    let ts = (api().PyEval_SaveThread)();
+    if let Some(s) = SEARCHER.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        s.clear();
+    }
+    (api().PyEval_RestoreThread)(ts);
+    none()
+}
+
 unsafe extern "C" fn f_decode_move(_: Obj, a: Obj) -> Obj {
     match int_of(a) {
         Some(v) if (0..ACTION_COUNT as i64).contains(&v) => move_tuple(v as u8),
@@ -768,7 +839,7 @@ macro_rules! getter {
 
 const FK: c_int = METH_FASTCALL | METH_KEYWORDS;
 
-static METHODS: [PyMethodDef; 24] = [
+static METHODS: [PyMethodDef; 25] = [
     meth!("make_move", m_make_move as FastKw, FK, "make_move(move, check=True)\n--\n\n手を指す。check=True なら非合法手で ValueError。"),
     meth!("undo_move", m_undo_move as NoArgs, METH_NOARGS, "直前の手（パスを含む）を取り消す。取り消す手がなければ False。"),
     meth!("make_pass", m_make_pass as NoArgs, METH_NOARGS, "パス（ヌルムーブ）。undo_move で取り消せる。"),
@@ -786,7 +857,8 @@ static METHODS: [PyMethodDef; 24] = [
     meth!("winner", m_winner as NoArgs, METH_NOARGS, "勝者（0 / 1）。終局していなければ None。"),
     meth!("is_terminal", m_is_terminal as NoArgs, METH_NOARGS, "(終局したか, 勝者 or -1)。"),
     meth!("repetitions", m_repetitions as NoArgs, METH_NOARGS, "現在の局面がこれまでの手で何回現れたか（初期局面は数えない）。"),
-    meth!("perft", m_perft as FastKw, FK, "perft(depth, bulk=False)\n--\n\n深さ depth の葉の数。計算中は GIL を解放する。"),
+    meth!("perft", m_perft as FastKw, FK, "perft(depth, bulk=False, threads=1)\n--\n\n深さ depth の葉の数。計算中は GIL を解放する。"),
+    meth!("search", m_search as FastKw, FK, "search(depth=4, time_ms=None, threads=1)\n--\n\nαβ 探索で最善手を返す: (手 or None, 評価値, 完了した深さ, ノード数)。置換表は呼び出し間で持ち越す。"),
     meth!("to_planes", m_to_planes as NoArgs, METH_NOARGS, "(4, 9, 9) float32 の bytes。np.frombuffer(p, np.float32).reshape(4, 9, 9)。"),
     meth!("clone", m_clone as NoArgs, METH_NOARGS, "盤面を複製する。"),
     meth!("__copy__", m_clone as NoArgs, METH_NOARGS, ""),
@@ -808,8 +880,9 @@ static GETSET: [PyGetSetDef; 10] = [
     PyGetSetDef { name: null(), get: null(), set: null(), doc: null(), closure: null_mut() },
 ];
 
-static MODULE_METHODS: [PyMethodDef; 3] = [
+static MODULE_METHODS: [PyMethodDef; 4] = [
     meth!("encode_move", f_encode_move as OneArg, METH_O, "タプル形式の指し手 → 手番号。"),
+    meth!("clear_search", f_clear_search as NoArgs, METH_NOARGS, "Board.search の置換表・キラー手・history を消す。"),
     meth!("decode_move", f_decode_move as OneArg, METH_O, "手番号 → タプル形式の指し手。"),
     PyMethodDef { ml_name: null(), ml_meth: null(), ml_flags: 0, ml_doc: null() },
 ];

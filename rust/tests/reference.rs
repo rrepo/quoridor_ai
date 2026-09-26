@@ -368,3 +368,63 @@ fn bench() {
         println!("  {kind}({d}) 初期局面 = {n}  {s:.3}s  ({:.1}M nodes/s)", n as f64 / s / 1e6);
     }
 }
+
+// ----------------------------------------------------------------------
+// 探索
+// ----------------------------------------------------------------------
+use quoridor_rs::{perft_parallel, Limits, Searcher};
+use std::time::Duration;
+
+#[test]
+fn search_finds_win_in_one() {
+    // P0 が (4,7)、P1 が (4,0) にいる → P0 は (4,8) へ進めば勝ち
+    let b = Board::from_parts([67, 4], [10, 10], 0, 0, 0);
+    let mut s = Searcher::new(16);
+    let r = s.search(&b, &Limits { max_depth: 3, time: None, threads: 1 });
+    assert_eq!(r.best, Some(76));
+    assert!(r.score >= quoridor_rs::eval::MATE);
+}
+
+#[test]
+fn search_is_deterministic_and_legal() {
+    let mut b = Board::new();
+    for a in [13, 67, HWALL_BASE + 27, VWALL_BASE + 45] {
+        b.make(a);
+    }
+    let lim = Limits { max_depth: 4, time: None, threads: 1 };
+    let r1 = Searcher::new(16).search(&b, &lim);
+    let r2 = Searcher::new(16).search(&b, &lim);
+    assert_eq!((r1.best, r1.score, r1.nodes), (r2.best, r2.score, r2.nodes));
+    assert!(b.is_legal(r1.best.unwrap()));
+    // 複数スレッドでも合法手を返す
+    let r = Searcher::new(16).search(&b, &Limits { max_depth: 5, time: None, threads: 4 });
+    assert!(b.is_legal(r.best.unwrap()) && r.depth == 5);
+    // 時間制限
+    let t = std::time::Instant::now();
+    let r = Searcher::new(16).search(&b, &Limits { max_depth: 60, time: Some(Duration::from_millis(200)), threads: 2 });
+    assert!(t.elapsed() < Duration::from_millis(600), "{:?}", t.elapsed());
+    assert!(b.is_legal(r.best.unwrap()));
+}
+
+#[test]
+fn parallel_perft_matches() {
+    let b = Board::new();
+    assert_eq!(perft_parallel(&b, 3, 8, false), 2062264);
+    assert_eq!(perft_parallel(&b, 3, 8, true), 2062264);
+}
+
+#[test]
+fn selfplay_finishes() {
+    let mut b = Board::new();
+    let mut s = Searcher::new(16);
+    for _ in 0..200 {
+        if b.winner().is_some() {
+            break;
+        }
+        let r = s.search(&b, &Limits { max_depth: 3, time: None, threads: 1 });
+        let a = r.best.unwrap();
+        assert!(b.is_legal(a));
+        b.make(a);
+    }
+    assert!(b.winner().is_some(), "game did not finish");
+}

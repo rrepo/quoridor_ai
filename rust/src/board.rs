@@ -44,6 +44,8 @@ struct Undo {
     prev_pos: u8,
     /// 指す前の経路キャッシュの有効ビット
     path_valid: u8,
+    /// 指す前の irrev
+    prev_irrev: u16,
     /// コマ移動のとき、動いた側の指す前の経路キャッシュ
     saved: PathCache,
 }
@@ -133,6 +135,13 @@ pub struct Board {
     pub walls: [u8; 2],
     pub turn: u8,
     pub hash: u64,
+    /// 壁の配置だけのハッシュ（最短距離のキャッシュのキーに使う）
+    pub whash: u64,
+    /// 盤上の壁の y 座標の合計と枚数（評価関数用に差分管理する）
+    pub wall_ysum: u16,
+    pub wall_count: u8,
+    /// 最後に壁を置いた直後の手数（これより前の局面とは千日手にならない）
+    irrev: u16,
     stack: Vec<Undo>,
     /// 各手の後のハッシュ（千日手判定用）
     history: Vec<u64>,
@@ -168,6 +177,10 @@ impl Board {
             walls: [MAX_WALLS; 2],
             turn: 0,
             hash: 0,
+            whash: 0,
+            wall_ysum: 0,
+            wall_count: 0,
+            irrev: 0,
             stack: Vec::with_capacity(256),
             history: Vec::with_capacity(256),
             z,
@@ -199,7 +212,39 @@ impl Board {
             m &= m - 1;
         }
         b.hash = b.compute_hash();
+        b.whash = b.compute_whash();
+        b.wall_count = (hmask.count_ones() + vmask.count_ones()) as u8;
+        b.wall_ysum = 0;
+        for m in [hmask, vmask] {
+            let mut m = m;
+            while m != 0 {
+                b.wall_ysum += (m.trailing_zeros() / 8) as u16;
+                m &= m - 1;
+            }
+        }
         b
+    }
+
+    /// player の最短距離を決める情報（壁の配置とそのコマの位置）のハッシュ
+    #[inline(always)]
+    pub fn dist_key(&self, player: usize) -> u64 {
+        self.whash ^ self.z.pos[player][self.pos[player] as usize]
+    }
+
+    fn compute_whash(&self) -> u64 {
+        let z = &*self.z;
+        let mut h = 0;
+        let mut m = self.hmask;
+        while m != 0 {
+            h ^= z.hwall[m.trailing_zeros() as usize];
+            m &= m - 1;
+        }
+        let mut m = self.vmask;
+        while m != 0 {
+            h ^= z.vwall[m.trailing_zeros() as usize];
+            m &= m - 1;
+        }
+        h
     }
 
     /// 現在の盤面からハッシュを計算し直す
@@ -238,7 +283,7 @@ impl Board {
         if a < HWALL_BASE {
             let old = self.pos[t];
             let mut pc = self.paths.get();
-            self.stack.push(Undo { action: a, prev_pos: old, path_valid: valid, saved: pc[t] });
+            self.stack.push(Undo { action: a, prev_pos: old, path_valid: valid, prev_irrev: self.irrev, saved: pc[t] });
             h ^= z.pos[t][old as usize] ^ z.pos[t][a as usize];
             self.pos[t] = a;
             // 経路キャッシュ: 移動先が経路上ならそのまま、1 マスの移動なら経路を延ばす
@@ -263,7 +308,10 @@ impl Board {
             let wl = self.walls[t] as usize;
             h ^= z.walls[t][wl] ^ z.walls[t][wl - 1];
             self.walls[t] -= 1;
-            self.stack.push(Undo { action: a, prev_pos: 0, path_valid: valid, saved: PathCache::default() });
+            self.stack.push(Undo { action: a, prev_pos: 0, path_valid: valid, prev_irrev: self.irrev, saved: PathCache::default() });
+            self.irrev = self.stack.len() as u16;
+            self.wall_count += 1;
+            self.wall_ysum += ((a - HWALL_BASE) % 64 / 8) as u16;
             // 経路キャッシュ: 経路を切る壁なら無効化（中身は残す）
             let pc = self.paths.get();
             let mut v = valid;
@@ -272,6 +320,7 @@ impl Board {
                 self.hmask |= 1u64 << w;
                 self.open_d &= !hwall_d_bits(w);
                 h ^= z.hwall[w];
+                self.whash ^= z.hwall[w];
                 for (p, c) in pc.iter().enumerate() {
                     if c.hcut >> w & 1 != 0 {
                         v &= !(1 << p);
@@ -282,6 +331,7 @@ impl Board {
                 self.vmask |= 1u64 << w;
                 self.open_r &= !vwall_r_bits(w);
                 h ^= z.vwall[w];
+                self.whash ^= z.vwall[w];
                 for (p, c) in pc.iter().enumerate() {
                     if c.vcut >> w & 1 != 0 {
                         v &= !(1 << p);
@@ -322,16 +372,21 @@ impl Board {
             let wl = self.walls[t] as usize;
             h ^= z.walls[t][wl] ^ z.walls[t][wl + 1];
             self.walls[t] += 1;
+            self.irrev = u.prev_irrev;
+            self.wall_count -= 1;
+            self.wall_ysum -= ((a - HWALL_BASE) % 64 / 8) as u16;
             if a < VWALL_BASE {
                 let w = (a - HWALL_BASE) as usize;
                 self.hmask &= !(1u64 << w);
                 self.open_d |= hwall_d_bits(w);
                 h ^= z.hwall[w];
+                self.whash ^= z.hwall[w];
             } else {
                 let w = (a - VWALL_BASE) as usize;
                 self.vmask &= !(1u64 << w);
                 self.open_r |= vwall_r_bits(w);
                 h ^= z.vwall[w];
+                self.whash ^= z.vwall[w];
             }
         }
         self.hash = h;
@@ -345,6 +400,7 @@ impl Board {
             action: PASS,
             prev_pos: 0,
             path_valid: self.path_valid.get(),
+            prev_irrev: self.irrev,
             saved: PathCache::default(),
         });
         self.turn ^= 1;
@@ -353,9 +409,38 @@ impl Board {
     }
 
     /// 現在の局面がこれまでの手で何回現れたか（初期局面は数えない）
+    ///
+    /// 壁は取り除けないので、最後に壁を置いた手より前の局面とは一致しない。そこで打ち切る。
+    #[inline]
     pub fn repetitions(&self) -> u32 {
+        self.repetitions_upto(u32::MAX)
+    }
+
+    /// repetitions と同じだが、limit 回見つかった時点で打ち切る
+    ///
+    /// 同じ局面は手番も同じなので 2 手おきに比べる。最後に壁を置いた直後の局面
+    /// （history[irrev - 1]）より前は壁の配置が違うので比べない。
+    #[inline]
+    pub fn repetitions_upto(&self, limit: u32) -> u32 {
         let h = self.hash;
-        self.history.iter().filter(|&&x| x == h).count() as u32
+        let hist = &self.history;
+        let lo = (self.irrev as usize).saturating_sub(1);
+        let mut n = 0;
+        let mut i = hist.len();
+        while i > lo {
+            i -= 1;
+            if hist[i] == h {
+                n += 1;
+                if n >= limit {
+                    break;
+                }
+            }
+            if i < lo + 2 {
+                break;
+            }
+            i -= 1;
+        }
+        n
     }
 
     pub fn ply(&self) -> usize {
@@ -498,6 +583,7 @@ impl Board {
     ///
     /// 前提: 両プレイヤーともゴールに到達可能な（合法な）局面であること。
     pub fn legal_wall_masks_restricted(&self, restrict_h: u64, restrict_v: u64) -> (u64, u64) {
+        crate::stat!(LEGAL_MASKS);
         let (vh, vv) = self.valid_wall_masks();
         let mut ch = vh & restrict_h;
         let mut cv = vv & restrict_v;

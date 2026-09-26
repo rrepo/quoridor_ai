@@ -14,6 +14,7 @@ pub fn expand(bits: u128, d: u128, r: u128) -> u128 {
 /// start（集合）から goal（集合）までの最短距離。到達不能なら None。
 #[inline]
 pub fn distance(start: u128, goal: u128, d: u128, r: u128) -> Option<u32> {
+    crate::stat!(DISTANCE);
     if start & goal != 0 {
         return Some(0);
     }
@@ -36,6 +37,7 @@ pub fn distance(start: u128, goal: u128, d: u128, r: u128) -> Option<u32> {
 /// start（集合）から goal（集合）へ到達できるか
 #[inline]
 pub fn reachable(start: u128, goal: u128, d: u128, r: u128) -> bool {
+    crate::stat!(REACHABLE);
     if start & goal != 0 {
         return true;
     }
@@ -61,6 +63,7 @@ pub fn reachable(start: u128, goal: u128, d: u128, r: u128) -> bool {
 /// 戻り値は経路の長さ（辺の数）。到達不能なら None。
 #[inline]
 pub fn trace_path<F: FnMut(usize, usize)>(start: usize, goal: u128, d: u128, r: u128, mut f: F) -> Option<u32> {
+    crate::stat!(TRACE);
     let s = 1u128 << start;
     if s & goal != 0 {
         return Some(0);

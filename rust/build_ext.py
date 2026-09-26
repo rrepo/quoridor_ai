@@ -30,7 +30,7 @@ def main():
     if os.name != "nt":
         sys.exit("現在の C API 実装は Windows 専用です（関数を python3XX.dll から解決するため）。")
     cargo = find_cargo()
-    subprocess.run([cargo, "build", "--release", "--features", "capi"], cwd=HERE, check=True)
+    subprocess.run([cargo, "build", "--release", "--lib"], cwd=HERE, check=True)
     src = HERE / "target" / "release" / "quoridor_rs.dll"
     dst = ROOT / "quoridor_rs.pyd"
     shutil.copyfile(src, dst)
