@@ -1,59 +1,143 @@
 # game/movegen.py
 #
-# board.edges 廃止対応:
-#   board.edges[node] → board.adj ビットマスクのイテレーション に統一
-#   隣接ノードの列挙は _iter_adj(adj, node) で行う
+# 合法手生成（ビットボード版）
+#
+#   all_legal_moves(board) : 全合法手（コマ移動 + 全合法壁）
+#   pawn_moves(board)      : コマ移動のみ
+#   all_wall_moves(board)  : 全合法壁
+#   wall_moves(board)      : 両者の最短経路付近・前方に限定した壁（探索用の候補絞り込み）
+#   legal_moves(board)     : pawn_moves + wall_moves（従来互換。全合法手ではない）
+#
+# 指し手タプルは board.PAWN_MOVE / HWALL_MOVE / VWALL_MOVE の共有オブジェクトを返す。
+# 生成順はビット番号の昇順（コマ移動 → 水平壁 → 垂直壁）。
 
-from game.board import BOARD_SIZE
-from game.pathfinding import shortest_path, shortest_path_nodes
-from game.wall import is_valid_wall_placement
+from game.board import BOARD_SIZE, PAWN_MOVE, HWALL_MOVE, VWALL_MOVE
+from game.wall import legal_wall_masks, path_cut_masks, valid_wall_masks  # noqa: F401 (再エクスポート)
 
 _BS = BOARD_SIZE
 
 
-def _iter_adj(adj: list, node: int):
-    """adj[node] のビットマスクから隣接ノードを順に yield する。"""
-    mask = adj[node]
+def _bits_to_moves(mask, table, out):
     while mask:
-        lsb = mask & (-mask)
-        yield lsb.bit_length() - 1
+        lsb = mask & -mask
+        out.append(table[lsb.bit_length() - 1])
         mask ^= lsb
+    return out
+
+
+# 壁マスク（64bit）→ 指し手リストを 8bit ずつの表引きで作る。
+# 壁は大半が合法なため、1 ビットずつ走査するより大幅に速い。
+#   _BYTE_MOVES[table][k][b] = バイト k の値が b のときの指し手タプル群
+def _build_byte_moves(table):
+    return [tuple(tuple(table[8 * k + i] for i in range(8) if (b >> i) & 1) for b in range(256))
+            for k in range(8)]
+
+
+_H_BYTES = _build_byte_moves(HWALL_MOVE)
+_V_BYTES = _build_byte_moves(VWALL_MOVE)
+
+
+def _wall_bits_to_moves(mask, byte_table, out):
+    k = 0
+    while mask:
+        b = mask & 0xFF
+        if b:
+            out.extend(byte_table[k][b])
+        mask >>= 8
+        k += 1
+    return out
+
+
+# ----------------------------------------------------------------------
+# コマ移動
+# ----------------------------------------------------------------------
+def pawn_dest_mask(board):
+    """手番側のコマの移動先をビットマスクで返す（ジャンプ・斜め移動を含む）。"""
+    t = board.turn
+    players = board.players
+    pos = players[t].pos
+    opp = players[t ^ 1].pos
+    D = board.open_d
+    R = board.open_r
+    c = 1 << pos
+    m = ((c & D) << 9) | ((c >> 9) & D) | ((c & R) << 1) | ((c >> 1) & R)
+    ob = 1 << opp
+    if m & ob:
+        # 相手と隣接 → 直進ジャンプ、塞がれていれば相手の左右（斜め）
+        m ^= ob
+        ao = ((ob & D) << 9) | ((ob >> 9) & D) | ((ob & R) << 1) | ((ob >> 1) & R)
+        jump = opp + opp - pos
+        if jump >= 0 and (ao >> jump) & 1:
+            m |= 1 << jump
+        else:
+            m |= ao & ~c
+    return m
 
 
 def pawn_moves(board):
-    moves = []
-    turn  = board.turn
-    pos   = board.players[turn].pos
-    opp   = board.players[1 - turn].pos
-    adj   = board.adj  # edges は廃止、adj のみ使用
-
-    for nxt in _iter_adj(adj, pos):
-        if nxt != opp:
-            moves.append(nxt)
-            continue
-
-        # 相手と隣接 → ジャンプ or 側面移動
-        dy = (opp // _BS) - (pos // _BS)
-        dx = (opp %  _BS) - (pos %  _BS)
-
-        jy = (opp // _BS) + dy
-        jx = (opp %  _BS) + dx
-        if 0 <= jy < _BS and 0 <= jx < _BS:
-            jump = jy * _BS + jx
-            if (adj[opp] >> jump) & 1:
-                moves.append(jump)
-                continue
-
-        for side in _iter_adj(adj, opp):
-            if side == pos:
-                continue
-            if (side // _BS - opp // _BS) == dy and (side % _BS - opp % _BS) == dx:
-                continue
-            moves.append(side)
-
-    return [("move", d) for d in moves]
+    return _bits_to_moves(pawn_dest_mask(board), PAWN_MOVE, [])
 
 
+# ----------------------------------------------------------------------
+# 壁
+# ----------------------------------------------------------------------
+def all_wall_moves(board):
+    """手番側が置ける全ての合法な壁。"""
+    if board.players[board.turn].walls == 0:
+        return []
+    h, v = legal_wall_masks(board)
+    out = _wall_bits_to_moves(h, _H_BYTES, [])
+    return _wall_bits_to_moves(v, _V_BYTES, out)
+
+
+def all_legal_moves(board):
+    """全合法手（コマ移動 + 全合法壁）。"""
+    out = _bits_to_moves(pawn_dest_mask(board), PAWN_MOVE, [])
+    if board.players[board.turn].walls:
+        h, v = legal_wall_masks(board)
+        _wall_bits_to_moves(h, _H_BYTES, out)
+        _wall_bits_to_moves(v, _V_BYTES, out)
+    return out
+
+
+# 前方の壁（行マスク）: _FORWARD[player][自分の行]
+#   P0: y >= row - 1   P1: y <= row
+_FORWARD = [
+    [sum(0xFF << (8 * y) for y in range(8) if y >= row - 1) for row in range(_BS)],
+    [sum(0xFF << (8 * y) for y in range(8) if y <= row) for row in range(_BS)],
+]
+
+
+def wall_moves(board):
+    """
+    探索用に絞り込んだ壁: 両者の最短経路（shortest_path_nodes の経路）の辺を
+    切る壁のうち、手番側から見て前方にあるもの。
+    """
+    my = board.turn
+    if board.players[my].walls == 0:
+        return []
+
+    c0 = path_cut_masks(board, 0)
+    if c0 is None:
+        return []
+    c1 = path_cut_masks(board, 1)
+    if c1 is None:
+        return []
+
+    fwd = _FORWARD[my][board.players[my].pos // _BS]
+    h, v = legal_wall_masks(board, (c0[0] | c1[0]) & fwd, (c0[1] | c1[1]) & fwd, (c0, c1))
+    out = _wall_bits_to_moves(h, _H_BYTES, [])
+    return _wall_bits_to_moves(v, _V_BYTES, out)
+
+
+def legal_moves(board):
+    """従来互換: コマ移動 + 絞り込んだ壁（全合法手が必要なら all_legal_moves）。"""
+    return pawn_moves(board) + wall_moves(board)
+
+
+# ----------------------------------------------------------------------
+# 互換用ヘルパ（経路から壁候補を列挙する旧実装）
+# ----------------------------------------------------------------------
 def _wall_candidates_from_path(path):
     """経路上の各エッジに対して直交する壁候補を列挙する。"""
     candidate = set()
@@ -63,13 +147,11 @@ def _wall_candidates_from_path(path):
         bx, by = b % _BS, b // _BS
 
         if ay == by:
-            # 水平移動 → 垂直壁候補
             wx = min(ax, bx)
             for wy in (ay - 1, ay):
                 if 0 <= wx < _BS - 1 and 0 <= wy < _BS - 1:
                     candidate.add(('v', wx, wy))
         else:
-            # 垂直移動 → 水平壁候補
             wy = min(ay, by)
             for wx in (ax - 1, ax):
                 if 0 <= wx < _BS - 1 and 0 <= wy < _BS - 1:
@@ -82,59 +164,6 @@ def _is_forward_wall(y: int, my_row: int, player: int) -> bool:
         return y >= my_row - 1
     else:
         return y <= my_row
-
-
-def wall_moves(board):
-    my    = board.turn
-    enemy = 1 - my
-    player = board.players[my]
-
-    if player.walls == 0:
-        return []
-
-    my_row = board.players[my].pos // _BS
-
-    enemy_path = shortest_path_nodes(board, enemy)
-    if enemy_path is None:
-        return []
-    candidates = _wall_candidates_from_path(enemy_path)
-
-    my_path = shortest_path_nodes(board, my)
-    if my_path is not None:
-        candidates |= _wall_candidates_from_path(my_path)
-
-    candidates = {
-        (kind, x, y) for (kind, x, y) in candidates
-        if _is_forward_wall(y, my_row, my)
-    }
-
-    moves   = []
-    h_walls = board.h_walls
-    v_walls = board.v_walls
-
-    for kind, x, y in candidates:
-        if kind == 'h':
-            if not is_valid_wall_placement(board, x, y, 'h'):
-                continue
-            board.apply_hwall(x, y)
-            h_walls.add((x, y))
-            if (shortest_path(board, enemy) is not None and
-                    shortest_path(board, my) is not None):
-                moves.append(("hwall", x, y))
-            board.undo_hwall(x, y)
-            h_walls.discard((x, y))
-        else:
-            if not is_valid_wall_placement(board, x, y, 'v'):
-                continue
-            board.apply_vwall(x, y)
-            v_walls.add((x, y))
-            if (shortest_path(board, enemy) is not None and
-                    shortest_path(board, my) is not None):
-                moves.append(("vwall", x, y))
-            board.undo_vwall(x, y)
-            v_walls.discard((x, y))
-
-    return moves
 
 
 def _pawn_move_score(turn, dest):
@@ -155,7 +184,3 @@ def order_moves(board, moves):
             wall.append(m)
     pawn.sort(key=lambda m: _pawn_move_score(turn, m[1]), reverse=True)
     return pawn + wall
-
-
-def legal_moves(board):
-    return pawn_moves(board) + wall_moves(board)
