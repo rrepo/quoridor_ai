@@ -1,0 +1,4 @@
+/target
+/quoridor_rs.pyd
+__pycache__/
+*.pyc

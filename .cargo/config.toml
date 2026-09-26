@@ -1,0 +1,5 @@
+# この PC の CPU 向けに最適化する（Zen 2 で探索が約 15% 速い）。
+# 別の PC へビルド済みのバイナリを持っていく場合はこの行を消すか、
+# RUSTFLAGS="-C target-cpu=x86-64-v2" のように上書きする。
+[build]
+rustflags = ["-C", "target-cpu=native"]
