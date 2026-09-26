@@ -1,4 +1,4 @@
-//! 探索（ai/search.py の移植 + Lazy SMP による並列化 + 時間制限）
+//! 探索（legacy/ai/search.py の移植 + Lazy SMP による並列化 + 時間制限）
 //!
 //! 反復深化 + aspiration window、PVS、移動手の LMR、ヌルムーブ枝刈り、置換表、
 //! キラー手・history による手順付けは Python 版と同じ構成。

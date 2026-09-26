@@ -1,8 +1,8 @@
 """
 PGO（プロファイルに基づく最適化）でビルドする。コードを変えたら実行し直すこと。
 
-    python rust/pgo.py            # quoridor.exe と quoridor_rs.pyd を PGO でビルド
-    python rust/pgo.py --compare  # あわせて PGO なしの版と速度を比べる
+    python scripts/pgo.py            # quoridor.exe と quoridor_rs.pyd を PGO でビルド
+    python scripts/pgo.py --compare  # あわせて PGO なしの版と速度を比べる
 
 必要なもの（Windows）:
   - Visual Studio Build Tools（「C++ によるデスクトップ開発」）
@@ -10,7 +10,7 @@ PGO（プロファイルに基づく最適化）でビルドする。コード�
   - rustup component add llvm-tools --toolchain stable-x86_64-pc-windows-msvc
 
 出力:
-  rust/target/pgo-use/x86_64-pc-windows-msvc/release/quoridor.exe
+  target/pgo-use/x86_64-pc-windows-msvc/release/quoridor.exe
   リポジトリ直下の quoridor_rs.pyd
 """
 import argparse
@@ -20,11 +20,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent
+ROOT = Path(__file__).resolve().parent.parent   # Cargo プロジェクト（リポジトリ直下）
 TARGET = "x86_64-pc-windows-msvc"
 TOOLCHAIN = f"stable-{TARGET}"
-PGO_DIR = HERE / "target" / "pgo"
+PGO_DIR = ROOT / "target" / "pgo"
 
 # プロファイルを集めるために実行する処理（探索・合法手生成・並列の自己対局）
 WORKLOAD = [
@@ -56,7 +55,7 @@ def build(cargo, rustflags, target_dir, *extra):
     # RUSTFLAGS を設定すると .cargo/config.toml の rustflags は使われないので、ここでも native を指定する
     env["RUSTFLAGS"] = " ".join(["-C", "target-cpu=native"] + rustflags)
     run([cargo, f"+{TOOLCHAIN}", "build", "--release", "--target", TARGET, "--target-dir", str(target_dir), *extra],
-        cwd=HERE, env=env)
+        cwd=ROOT, env=env)
     return Path(target_dir) / TARGET / "release"
 
 
@@ -81,7 +80,7 @@ def main():
     merged = PGO_DIR / "merged.profdata"
 
     # 1. 計測用ビルド → 典型的な処理を実行してプロファイルを集める
-    gen = build(cargo, [f"-Cprofile-generate={raw.as_posix()}"], HERE / "target" / "pgo-gen", "--bin", "quoridor")
+    gen = build(cargo, [f"-Cprofile-generate={raw.as_posix()}"], ROOT / "target" / "pgo-gen", "--bin", "quoridor")
     for w in WORKLOAD:
         run([str(gen / "quoridor.exe"), *w], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -89,13 +88,13 @@ def main():
     run([str(profdata), "merge", "-o", str(merged), str(raw)])
 
     # 3. プロファイルを使ってビルド（ライブラリ = Python 拡張 と コマンドライン）
-    out = build(cargo, [f"-Cprofile-use={merged.as_posix()}"], HERE / "target" / "pgo-use")
+    out = build(cargo, [f"-Cprofile-use={merged.as_posix()}"], ROOT / "target" / "pgo-use")
     shutil.copyfile(out / "quoridor_rs.dll", ROOT / "quoridor_rs.pyd")
     print(f"built: {out / 'quoridor.exe'}")
     print(f"built: {ROOT / 'quoridor_rs.pyd'}")
 
     if args.compare:
-        plain = build(cargo, [], HERE / "target" / "plain-msvc", "--bin", "quoridor")
+        plain = build(cargo, [], ROOT / "target" / "plain-msvc", "--bin", "quoridor")
         for label, exe in (("PGO なし", plain / "quoridor.exe"), ("PGO あり", out / "quoridor.exe")):
             for w in (["bench", "--depth", "9"], ["perft", "4", "--bulk"]):
                 r = subprocess.run([str(exe), *w], capture_output=True, text=True, encoding="utf-8").stdout

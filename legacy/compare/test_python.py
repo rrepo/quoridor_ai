@@ -1,8 +1,8 @@
 """
-Rust 版（quoridor_rs）と Python 版（game/）をランダム対局で突き合わせる。
+Rust 版（quoridor_rs）と Python 版（legacy/game/）をランダム対局で突き合わせる。
 
-    python rust/build_ext.py
-    python rust/test_python.py
+    python scripts/build_ext.py
+    python legacy/compare/test_python.py
 """
 import copy
 import ctypes
@@ -11,8 +11,9 @@ import random
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+ROOT = Path(__file__).resolve().parents[2]      # リポジトリ直下（quoridor_rs.pyd）
+LEGACY = ROOT / "legacy"                        # Python 版（game/, ai/）
+sys.path[:0] = [str(ROOT), str(LEGACY)]
 
 import quoridor_rs as q                                   # noqa: E402
 from game.board import Board as PyBoard                   # noqa: E402

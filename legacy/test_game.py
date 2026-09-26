@@ -6,7 +6,7 @@ import sys
 import traceback
 import time
 
-sys.path.insert(0, ".")
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 
 from game.board import Board, BOARD_SIZE, NODE_COUNT
 from game.pathfinding import shortest_path, shortest_path_nodes

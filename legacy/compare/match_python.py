@@ -1,16 +1,16 @@
 """
-Rust 版 AI（quoridor_rs.Board.search）と Python 版 AI（ai/search.py）を対局させる。
+Rust 版 AI（quoridor_rs.Board.search）と Python 版 AI（legacy/ai/search.py）を対局させる。
 
-    python rust/build_ext.py
-    python rust/match_python.py <序盤の数> <Rust の深さ> <Python の深さ>
+    python scripts/build_ext.py
+    python legacy/compare/match_python.py <序盤の数> <Rust の深さ> <Python の深さ>
     （Rust の深さに負の値 -N を渡すと「1 手 N ミリ秒」の時間制限になる）
 
 序盤 4 手をランダムに指した局面から、先後を入れ替えて 2 局ずつ対局する。
 """
 import sys, random, time, multiprocessing as mp
 from pathlib import Path
-ROOT = str(Path(__file__).resolve().parent.parent)
-sys.path.insert(0, ROOT)
+_ROOT = Path(__file__).resolve().parents[2]     # リポジトリ直下（quoridor_rs.pyd）
+sys.path[:0] = [str(_ROOT), str(_ROOT / "legacy")]
 
 def play(args):
     opening_seed, rust_first, depth_rs, depth_py = args

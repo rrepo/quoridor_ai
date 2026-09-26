@@ -1,4 +1,4 @@
-//! 評価関数と壁の手順付け用スコア（ai/eval_func.py・ai/wall_evaluation.py の移植）
+//! 評価関数と壁の手順付け用スコア（legacy/ai/eval_func.py・legacy/ai/wall_evaluation.py の移植）
 //!
 //! 評価値は Python 版の 100 倍の整数（小数の重みを保ったまま、探索窓を整数で扱うため）。
 

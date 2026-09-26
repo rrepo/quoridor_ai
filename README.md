@@ -1,10 +1,11 @@
 # quoridor_rs — コリドールのルールエンジンと探索（Rust）
 
-`game/`（ルール）と `ai/`（αβ 探索・評価関数）を Rust で実装したもの。
+コリドールのルールエンジンと AI（αβ 探索）。Rust で実装している。
+以前の Python 版は [legacy/](legacy/) に参照用として残している（Rust 版の正しさの検証にも使う）。
 
 - ルール: 盤面・指し手の実行と取消・全合法手・最短経路・Zobrist ハッシュ・perft
 - 探索: 反復深化 + aspiration window、PVS、LMR、ヌルムーブ、置換表、キラー手・history
-  （`ai/search.py` の移植）。**複数スレッド（Lazy SMP）** と **時間制限** に対応
+  （`legacy/ai/search.py` の移植）。**複数スレッド（Lazy SMP）** と **時間制限** に対応
 - 使い方: コマンドライン（`quoridor`）/ Rust ライブラリ / Python 拡張 `quoridor_rs`
 
 ## ビルドと実行
@@ -13,7 +14,6 @@
 `.cargo/config.toml` で `target-cpu=native`（この PC の CPU 向け最適化）を有効にしている。
 
 ```sh
-cd rust
 cargo build --release
 
 # perft（全合法手の木の葉の数）
@@ -34,10 +34,10 @@ target/release/quoridor bench --depth 9 --threads 1
 ### テスト
 
 ```sh
-cd rust && cargo test --release     # 参照実装との突き合わせ・perft の既知値・探索
-python rust/build_ext.py            # Python 拡張をビルド（リポジトリ直下に quoridor_rs.pyd。PGO 版は rust/pgo.py）
-python rust/test_python.py          # Python 版 game/ との突き合わせ（生成順・経路まで一致）
-python rust/match_python.py 40 4 4  # Rust 版 AI と Python 版 AI の対局（同じ深さ）
+cargo test --release                          # 参照実装との突き合わせ・perft の既知値・探索
+python scripts/build_ext.py                   # Python 拡張をビルド（リポジトリ直下に quoridor_rs.pyd。PGO 版は scripts/pgo.py）
+python legacy/compare/test_python.py          # Python 版 legacy/game/ との突き合わせ（生成順・経路まで一致）
+python legacy/compare/match_python.py 40 4 4  # Rust 版 AI と Python 版 AI の対局（同じ深さ）
 ```
 
 計測用のカウンタ（BFS の回数や処理ごとの CPU サイクル）は `--features stats` で有効になる:
@@ -61,8 +61,30 @@ q.clear_search()                                            # 置換表などを
 b.perft(4, bulk=True, threads=8)
 ```
 
-`search` の置換表・キラー手・history は呼び出し間で持ち越す（Python 版 `ai/search.py` と同じ）。
+`search` の置換表・キラー手・history は呼び出し間で持ち越す（Python 版 `legacy/ai/search.py` と同じ）。
 探索中と perft 中は GIL を解放する。
+
+## ディレクトリ構成
+
+```
+Cargo.toml, .cargo/config.toml   Rust プロジェクト（target-cpu=native）
+src/
+  board.rs    盤面・make/undo・合法手・最短経路（ビットボード）
+  consts.rs   定数と事前計算テーブル
+  path.rs     ビットボード BFS
+  zobrist.rs  Zobrist ハッシュ
+  eval.rs     評価関数・壁の手順付け用スコア
+  search.rs   αβ 探索（Lazy SMP・時間制限）・並列 perft
+  tt.rs       置換表（ロックなし・スレッド共有）
+  capi.rs     Python 拡張モジュール（CPython の安定 ABI を直接呼ぶ）
+  stats.rs    計測用カウンタ（--features stats）
+  bin/quoridor.rs  コマンドライン
+tests/reference.rs   独立した参照実装との突き合わせ・perft・探索のテスト、ベンチマーク
+scripts/
+  build_ext.py  Python 拡張（quoridor_rs.pyd）のビルド
+  pgo.py        PGO ビルド（MSVC ツールチェーン）
+legacy/         Python 版（参照用）と、Rust 版との突き合わせスクリプト
+```
 
 ## 実装の要点
 
@@ -100,12 +122,12 @@ b.perft(4, bulk=True, threads=8)
 ## PGO（プロファイルに基づく最適化）
 
 ```sh
-python rust/pgo.py            # quoridor.exe と quoridor_rs.pyd を PGO でビルド（コードを変えたら実行し直す）
-python rust/pgo.py --compare  # PGO なしの版と速度を比べる
+python scripts/pgo.py            # quoridor.exe と quoridor_rs.pyd を PGO でビルド（コードを変えたら実行し直す）
+python scripts/pgo.py --compare  # PGO なしの版と速度を比べる
 ```
 
 計測用ビルドでベンチ・perft・自己対局を実行してプロファイルを集め、それを使って
-`rust/target/pgo-use/x86_64-pc-windows-msvc/release/quoridor.exe` と、リポジトリ直下の `quoridor_rs.pyd` を作る。
+`target/pgo-use/x86_64-pc-windows-msvc/release/quoridor.exe` と、リポジトリ直下の `quoridor_rs.pyd` を作る。
 効果はこの PC で探索・perft とも 3〜5% 程度（1 ノードあたりの処理が既に小さいため控えめ）。
 
 `x86_64-pc-windows-gnu` には PGO の計測用ランタイム（`profiler_builtins`）が含まれないため、MSVC 版を使う:

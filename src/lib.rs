@@ -2,7 +2,7 @@
 //!
 //! - `Board`: 盤面・指し手の実行と取消・合法手生成・最短経路
 //! - 指し手は u8 の番号（0〜80 = コマの移動先、81〜144 = 水平壁、145〜208 = 垂直壁）
-//! - `Searcher`: αβ 探索（ai/search.py の移植、Lazy SMP による並列化・時間制限付き）
+//! - `Searcher`: αβ 探索（legacy/ai/search.py の移植、Lazy SMP による並列化・時間制限付き）
 //! - Windows では cdylib（quoridor_rs.dll）が CPython 拡張モジュール `quoridor_rs` を兼ねる
 //!   （PyO3 などの依存クレートを使わず、CPython の安定 ABI を実行時に解決して呼ぶ）
 

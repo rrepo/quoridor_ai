@@ -3,7 +3,7 @@
 //! 1 エントリ = 2 つの AtomicU64（key ^ data, data）。読み出し時に key ^ data が一致しなければ
 //! 他スレッドの書き込み途中とみなして捨てる（Lazy SMP でよく使われる方式）。
 //!
-//! 置き換え規則は Python 版（ai/search.py の _tt_store）と同じ:
+//! 置き換え規則は Python 版（legacy/ai/search.py の _tt_store）と同じ:
 //!   - 同じ局面・同じ世代で、既存の深さ >= 新しい深さ なら上書きしない
 //!   - 別の局面で、既存が新しい世代（GEN_WINDOW 以内）かつ既存の深さ > 新しい深さ なら上書きしない
 

@@ -2,7 +2,7 @@
 name = "quoridor_rs"
 version = "0.1.0"
 edition = "2021"
-description = "Quoridor rules engine (bitboard) with optional Python bindings"
+description = "Quoridor rules engine and alpha-beta search (bitboard), with a CLI and a Python extension"
 
 [lib]
 name = "quoridor_rs"
