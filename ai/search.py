@@ -1,6 +1,6 @@
 # ai/search.py
 
-from game.movegen import legal_moves
+from game.movegen import legal_moves, pawn_moves, wall_moves as gen_wall_moves
 from game.search import is_terminal
 from ai.eval_func import evaluate
 from ai.cache import clear_dist_cache
@@ -288,16 +288,10 @@ def alphabeta(board, depth: int, alpha: float, beta: float,
     # TT 手が存在してもβカットせず最善手でない場合、ゼロ窓で探索すると
     # PV 手を見落とすリスクがあるため。
     # ------------------------------------------------------------------
-    all_moves = legal_moves(board)
-    if not all_moves:
-        return evaluate(board)
-
-    move_moves = [m for m in all_moves if m[0] == "move" and m != tt_move]
-    wall_moves = [m for m in all_moves if m[0] != "move" and m != tt_move]
-
-    # 終盤: 双方壁ゼロなら壁手スキップ
-    if my_walls == 0 and enemy_walls == 0:
-        wall_moves = []
+    # 壁手は移動手でβカットしなかった場合のみ生成する（遅延生成）。
+    # 壁手の生成（候補列挙 + 経路チェック）はノード処理で最も重いため。
+    all_pawn   = pawn_moves(board)
+    move_moves = [m for m in all_pawn if m != tt_move]
 
     # move_score クロージャを排除してインライン lambda に統一
     # （alphabeta 呼び出しごとの関数オブジェクト生成コストを削減）
@@ -346,6 +340,16 @@ def alphabeta(board, depth: int, alpha: float, beta: float,
     # ------------------------------------------------------------------
     # フェーズ3: 壁手（PVS のみ・LMR なし）
     # ------------------------------------------------------------------
+    # 自分の壁がゼロなら壁手なし
+    if my_walls == 0:
+        wall_moves = []
+    else:
+        wall_moves = gen_wall_moves(board)
+    if not all_pawn and not wall_moves:
+        return evaluate(board)
+    if tt_move is not None:
+        wall_moves = [m for m in wall_moves if m != tt_move]
+
     if wall_moves:
         wall_moves = _order_wall_moves(board, wall_moves, depth)
 
@@ -418,8 +422,12 @@ def best_move(board, max_depth: int):
         retries    = 0
 
         while True:
-            entry   = _tt_get(board.zobrist)
-            tt_move = entry[5] if entry is not None else None
+            # 前回反復の最善手を最優先（ルートは TT に保存されないため）
+            if best_mv is not None:
+                tt_move = best_mv
+            else:
+                entry   = _tt_get(board.zobrist)
+                tt_move = entry[5] if entry is not None else None
             ordered = _order_moves(board, moves, d, tt_move)
 
             best_score   = -99999.0
