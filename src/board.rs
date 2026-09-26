@@ -231,6 +231,16 @@ impl Board {
         self.whash ^ self.z.pos[player][self.pos[player] as usize]
     }
 
+    /// 壁 w（水平なら horizontal）の Zobrist 値（置いた後の dist_key は dist_key ^ これ）
+    #[inline(always)]
+    pub fn wall_zobrist(&self, horizontal: bool, w: usize) -> u64 {
+        if horizontal {
+            self.z.hwall[w]
+        } else {
+            self.z.vwall[w]
+        }
+    }
+
     fn compute_whash(&self) -> u64 {
         let z = &*self.z;
         let mut h = 0;
@@ -682,6 +692,25 @@ impl Board {
         } else {
             let bit = 1u64 << (a - VWALL_BASE);
             self.legal_wall_masks_restricted(0, bit).1 != 0
+        }
+    }
+
+    /// 手 a が「壁が経路を断つか」以外の点で合法か（is_legal より軽い。BFS をしない）
+    ///
+    /// ここで弾く壁（残数のない壁・重なる／交差する壁）は make すると盤面が壊れる。
+    #[inline]
+    pub fn is_pseudo_legal(&self, a: u8) -> bool {
+        if a < HWALL_BASE {
+            return (self.pawn_dest_mask() >> a) & 1 != 0;
+        }
+        if a as usize >= ACTION_COUNT || self.walls[self.turn as usize] == 0 {
+            return false;
+        }
+        let (vh, vv) = self.valid_wall_masks();
+        if a < VWALL_BASE {
+            (vh >> (a - HWALL_BASE)) & 1 != 0
+        } else {
+            (vv >> (a - VWALL_BASE)) & 1 != 0
         }
     }
 

@@ -456,20 +456,10 @@ type FastKw = unsafe extern "C" fn(Obj, *const Obj, Ssize, Obj) -> Obj;
 type NoArgs = unsafe extern "C" fn(Obj, Obj) -> Obj;
 type OneArg = unsafe extern "C" fn(Obj, Obj) -> Obj;
 
-/// 壁の残数がない・既存の壁と重なる／交差する壁か（Board::make に渡すと盤面が壊れる手）
+/// 壁の残数がない・既存の壁と重なる／交差する壁か（Board::make に渡すと盤面が壊れる手）。
+/// check=False ではコマの移動先は確認しない（任意のマスへ動かせる）
 fn breaks_board(b: &Board, a: u8) -> bool {
-    if a < HWALL_BASE {
-        return false;
-    }
-    if b.walls[b.turn as usize] == 0 {
-        return true;
-    }
-    let (vh, vv) = b.valid_wall_masks();
-    if a < VWALL_BASE {
-        (vh >> (a - HWALL_BASE)) & 1 == 0
-    } else {
-        (vv >> (a - VWALL_BASE)) & 1 == 0
-    }
+    a >= HWALL_BASE && !b.is_pseudo_legal(a)
 }
 
 /// make_move(move, check=True)

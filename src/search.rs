@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 
 use crate::board::Board;
 use crate::consts::*;
-use crate::eval::{evaluate_with, wall_score, WallScoreCtx, INF, MATE};
+use crate::eval::{evaluate_with, wall_score, wall_score_with, WallScoreCtx, INF, MATE};
+use crate::path::distance;
 use crate::tt::{Tt, EXACT, GEN_WINDOW, LOWER, NO_MOVE, UPPER};
 
 const MAX_DEPTH: usize = 64;
@@ -96,18 +97,28 @@ fn wall_rows(b: &Board, me: usize) -> u64 {
     }
 }
 
-/// 探索用に絞り込んだ壁（両者の最短経路を切る、wall_rows の範囲の合法な壁）と、その計算に使った切断マスク
-fn candidate_walls(b: &Board) -> Option<((u64, u64), [(u64, u64); 2])> {
+/// 探索用に絞り込んだ壁（両者の最短経路を切る、wall_rows の範囲の合法な壁）と、その計算に使った切断マスク。
+/// cuts(p) はプレイヤー p の最短経路の切断マスク（到達不能なら None）
+#[inline]
+fn candidate_walls_with(
+    b: &Board,
+    mut cuts: impl FnMut(usize) -> Option<(u64, u64)>,
+) -> Option<((u64, u64), [(u64, u64); 2])> {
     crate::stat!(CANDIDATES);
     let me = b.turn as usize;
     if b.walls[me] == 0 {
         return None;
     }
-    let c0 = b.path_cut_masks(0)?;
-    let c1 = b.path_cut_masks(1)?;
+    let c0 = cuts(0)?;
+    let c1 = cuts(1)?;
     let fwd = wall_rows(b, me);
     let walls = b.legal_wall_masks_restricted((c0.0 | c1.0) & fwd, (c0.1 | c1.1) & fwd);
     Some((walls, [c0, c1]))
+}
+
+/// candidate_walls_with（切断マスクをその場で計算する。ルートで使う）
+fn candidate_walls(b: &Board) -> Option<((u64, u64), [(u64, u64); 2])> {
+    candidate_walls_with(b, |p| b.path_cut_masks(p))
 }
 
 #[inline(always)]
@@ -314,14 +325,36 @@ impl Worker<'_> {
     /// player の最短距離（キャッシュ付き）
     #[inline(always)]
     fn dist(&mut self, b: &Board, player: usize) -> Option<u32> {
-        let k = b.dist_key(player);
-        let e = &mut self.st.dist[k as usize & (DIST_CACHE - 1)];
-        if e.0 == k {
+        self.dist_keyed(b.dist_key(player), b.pos[player], player, b.open_d, b.open_r)
+    }
+
+    /// dist_key が key の局面での player（位置 start）の最短距離（キャッシュ付き）。d / r はその局面の辺。
+    /// 壁の手順付けで「壁を置いた後」の距離を求めるときにも使い、その壁を実際に置いた子局面の評価でも当たるようにする
+    #[inline(always)]
+    fn dist_keyed(&mut self, key: u64, start: u8, player: usize, d: u128, r: u128) -> Option<u32> {
+        let e = &mut self.st.dist[key as usize & (DIST_CACHE - 1)];
+        if e.0 == key {
             return if e.1 == NO_DIST { None } else { Some(e.1 as u32) };
         }
-        let d = b.shortest_path(player);
-        *e = (k, d.map_or(NO_DIST, |v| v as u8));
-        d
+        let v = distance(1u128 << start, GOAL[player], d, r);
+        *e = (key, v.map_or(NO_DIST, |v| v as u8));
+        v
+    }
+
+    /// 壁を置いた子局面の距離を、距離のキャッシュに先に入れておく。
+    /// 壁が player の最短経路（cuts）を切らなければ、その経路が残り、壁が増えて距離が縮むことはないので、距離は dist のまま。
+    /// 子局面（多くは探索の末端）の評価で BFS をせずに済む
+    #[inline(always)]
+    fn seed_wall_child(&mut self, b: &Board, horizontal: bool, w: usize, cuts: &[(u64, u64); 2], dist: &[Option<u32>; 2]) {
+        let bit = 1u64 << w;
+        let wz = b.wall_zobrist(horizontal, w);
+        for p in 0..2 {
+            let cut = (if horizontal { cuts[p].0 } else { cuts[p].1 }) & bit != 0;
+            if let (false, Some(d)) = (cut, dist[p]) {
+                let key = b.dist_key(p) ^ wz;
+                self.st.dist[key as usize & (DIST_CACHE - 1)] = (key, d as u8);
+            }
+        }
     }
 
     /// player の最短経路を切る壁（キャッシュ付き）
@@ -346,16 +379,7 @@ impl Worker<'_> {
 
     /// candidate_walls のキャッシュ付き版
     fn candidate_walls(&mut self, b: &Board) -> Option<((u64, u64), [(u64, u64); 2])> {
-        crate::stat!(CANDIDATES);
-        let me = b.turn as usize;
-        if b.walls[me] == 0 {
-            return None;
-        }
-        let c0 = self.cuts(b, 0)?;
-        let c1 = self.cuts(b, 1)?;
-        let fwd = wall_rows(b, me);
-        let walls = b.legal_wall_masks_restricted((c0.0 | c1.0) & fwd, (c0.1 | c1.1) & fwd);
-        Some((walls, [c0, c1]))
+        candidate_walls_with(b, |p| self.cuts(b, p))
     }
 
     #[inline(always)]
@@ -379,6 +403,10 @@ impl Worker<'_> {
     #[allow(clippy::too_many_arguments)]
     fn search_child(&mut self, b: &mut Board, mv: u8, depth: i32, alpha: i32, beta: i32, first: bool, lmr: bool, defer: bool) -> Option<i32> {
         b.make(mv);
+        // 子局面が末端でなければ置換表を引くので、千日手・終局の判定をしている間に先読みしておく
+        if depth > 1 {
+            self.tt.prefetch(b.hash);
+        }
         if defer && self.shared.is_busy(b.hash) {
             b.undo();
             return None;
@@ -586,12 +614,8 @@ impl Worker<'_> {
             let __t = unsafe { core::arch::x86_64::_rdtsc() };
             let mut walls = WallList::new();
             let k = self.st.killers[di];
-            let ctx = if depth >= WALL_ORDER_DEPTH {
-                let dist = [self.dist(b, 0), self.dist(b, 1)];
-                Some(WallScoreCtx::with_dist(b, cuts, dist))
-            } else {
-                None
-            };
+            let dist = [self.dist(b, 0), self.dist(b, 1)];
+            let ctx = if depth >= WALL_ORDER_DEPTH { Some(WallScoreCtx::with_dist(b, cuts, dist)) } else { None };
             for (horizontal, mut m) in [(true, hm), (false, vm)] {
                 while m != 0 {
                     let w = m.trailing_zeros() as usize;
@@ -602,7 +626,11 @@ impl Worker<'_> {
                     } else if mv == k[1] {
                         800_000
                     } else if let Some(ctx) = &ctx {
-                        (wall_score(b, horizontal, w, ctx) * 1000.0) as i64 + self.st.history[mv as usize] as i64
+                        let wz = b.wall_zobrist(horizontal, w);
+                        let ws = wall_score_with(b, horizontal, w, ctx, |p, d, r| {
+                            self.dist_keyed(b.dist_key(p) ^ wz, b.pos[p], p, d, r)
+                        });
+                        (ws * 1000.0) as i64 + self.st.history[mv as usize] as i64
                     } else {
                         self.st.history[mv as usize] as i64
                     };
@@ -614,6 +642,9 @@ impl Worker<'_> {
             crate::stats::counters::CYC_ORDER.fetch_add(unsafe { core::arch::x86_64::_rdtsc() } - __t, Ordering::Relaxed);
 
             for mv in walls.moves() {
+                let (horizontal, w) =
+                    if mv < VWALL_BASE { (true, (mv - HWALL_BASE) as usize) } else { (false, (mv - VWALL_BASE) as usize) };
+                self.seed_wall_child(b, horizontal, w, &cuts, &dist);
                 match self.search_child(b, mv, depth, alpha, beta, is_first, false, can_defer && !is_first) {
                     Some(s) => {
                         is_first = false;

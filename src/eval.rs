@@ -114,6 +114,19 @@ impl WallScoreCtx {
 ///
 /// 相手の距離の伸び × 1.5 − 自分の距離の伸び。最短経路を切らない壁は距離が変わらないので BFS しない。
 pub fn wall_score(b: &Board, horizontal: bool, w: usize, ctx: &WallScoreCtx) -> f32 {
+    wall_score_with(b, horizontal, w, ctx, |p, d, r| distance(1u128 << b.pos[p], GOAL[p], d, r))
+}
+
+/// wall_score と同じだが、壁を置いた後の距離を after(プレイヤー, open_d, open_r) で求める
+/// （探索では距離のキャッシュを引く。open_d / open_r は壁を置いた後の辺）
+#[inline]
+pub fn wall_score_with<F: FnMut(usize, u128, u128) -> Option<u32>>(
+    b: &Board,
+    horizontal: bool,
+    w: usize,
+    ctx: &WallScoreCtx,
+    mut after: F,
+) -> f32 {
     crate::stat!(WALL_SCORE);
     let (me, en) = (ctx.me, ctx.me ^ 1);
     let bit = 1u64 << w;
@@ -123,8 +136,7 @@ pub fn wall_score(b: &Board, horizontal: bool, w: usize, ctx: &WallScoreCtx) -> 
     } else {
         (b.open_d, b.open_r & !crate::consts::vwall_r_bits(w))
     };
-    let after = |p: usize| distance(1u128 << b.pos[p], GOAL[p], d, r);
-    let delta = |p: usize| match (ctx.dist[p], after(p)) {
+    let mut delta = |p: usize| match (ctx.dist[p], after(p, d, r)) {
         (Some(before), Some(a)) => a as f32 - before as f32,
         _ => 0.0,
     };

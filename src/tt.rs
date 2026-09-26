@@ -92,6 +92,19 @@ impl Tt {
         Some((k ^ d, Entry::unpack(d)))
     }
 
+    /// key のエントリをキャッシュへ先読みする（すぐ後で probe / store するときのメモリ待ちを減らす）
+    #[inline(always)]
+    pub fn prefetch(&self, key: u64) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            // SAFETY: 先読みはメモリを読み書きしない（無効なアドレスでも例外にならない）。ここでは有効なスロットを指す
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(self.slot(key).as_ptr() as *const i8) };
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = key;
+    }
+
     /// 同じ局面のエントリ（世代は見ない）
     #[inline]
     pub fn probe(&self, key: u64) -> Option<Entry> {
