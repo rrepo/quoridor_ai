@@ -1,0 +1,19 @@
+[package]
+name = "quoridor_rs"
+version = "0.1.0"
+edition = "2021"
+description = "Quoridor rules engine (bitboard) with optional Python bindings"
+
+[lib]
+name = "quoridor_rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# CPython 拡張モジュール（quoridor_rs.pyd）としてビルドするとき。依存クレートは不要。
+capi = []
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
