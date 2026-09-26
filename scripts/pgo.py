@@ -29,6 +29,9 @@ PGO_DIR = ROOT / "target" / "pgo"
 WORKLOAD = [
     ["bench", "--depth", "9"],
     ["bench", "--depth", "8", "--threads", "4"],
+    # 既定のスレッド数（論理スレッド数）での並列探索（補助スレッド・ABDADA の経路）
+    ["search", "--depth", "11", "m13", "m67", "m22", "m58"],
+    ["search", "--time", "1000", "m13", "m67", "m22", "m58", "h3,5"],
     ["perft", "4", "--bulk"],
     ["perft", "3"],
     ["selfplay", "--games", "16", "--jobs", "8", "--a", "depth=6", "--b", "time=30,threads=2"],
