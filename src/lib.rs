@@ -21,5 +21,5 @@ pub mod zobrist;
 mod capi;
 
 pub use board::{decode_action, encode_move, Board, Move, MoveList, PASS};
-pub use search::{perft_parallel, Limits, SearchResult, Searcher};
+pub use search::{default_threads, perft_parallel, Limits, SearchResult, Searcher};
 pub use consts::{ACTION_COUNT, HWALL_BASE, VWALL_BASE};

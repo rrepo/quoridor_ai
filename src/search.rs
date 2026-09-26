@@ -5,13 +5,17 @@
 //! Python 版からの変更点:
 //!   - 評価値は 100 倍の整数（探索窓の幅 1 が正確な意味を持つ）
 //!   - 壁の手順付けで向きを取り違えていたバグ（"hwall" を 'h' と比較していた）を修正
-//!   - 複数スレッド（置換表を共有し、各スレッドが同じ局面を探索する Lazy SMP）
+//!   - 複数スレッド（置換表を共有し、各スレッドが同じ局面を探索する Lazy SMP）。
+//!     補助スレッドは反復の深さをずらし（SKIP_SIZE / SKIP_PHASE）、他のスレッドが探索中の
+//!     子局面は後回しにして（ABDADA）、スレッド間で同じ部分木を重複して探索しにくくしている。
+//!     補助スレッドは Searcher が常駐させて使い回す（探索のたびにスレッドを作らない）
 //!   - 時間制限（反復深化の途中で打ち切り、最後に完了した深さの手を返す）
 //!   - 壁の候補の範囲: 相手に並ばれた・追い越された後は相手のゴール側も含める（wall_rows）
 //!   - history に上限を設ける（HISTORY_MAX。長い探索でキラー手や前回の最善手を追い越さないように）
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::board::Board;
@@ -174,6 +178,9 @@ const CUT_CACHE: usize = 1 << 12;
 const NO_DIST: u8 = 255;
 
 /// スレッドごとに持ち越す状態（Python 版ではモジュール全体の killer_moves / history / 距離キャッシュ）
+///
+/// 主スレッドの分は Searcher が、補助スレッドの分はそれぞれのスレッドが持つ（別々の場所に置かれるので、
+/// スレッド間でキャッシュラインを共有しない）。
 #[derive(Clone)]
 struct ThreadState {
     killers: [[u8; 2]; MAX_DEPTH],
@@ -200,6 +207,94 @@ struct Shared {
     stop: AtomicBool,
     /// (完了した深さ, 最善手, 評価値)
     best: Mutex<(u32, u8, i32)>,
+    /// いずれかのスレッドが探索中の局面のハッシュ（ABDADA。添字は hash & (BUSY_SIZE - 1)）。
+    /// 単一スレッドでは使わないので空（busy_slot / is_busy は smp のときだけ呼ぶ）
+    busy: Vec<AtomicU64>,
+}
+
+impl Shared {
+    /// smp が偽（単一スレッド）なら探索中の局面の表（128KB）を作らない
+    fn new(smp: bool) -> Self {
+        Shared {
+            stop: AtomicBool::new(false),
+            best: Mutex::new((0, NO_MOVE, 0)),
+            busy: if smp { (0..BUSY_SIZE).map(|_| AtomicU64::new(0)).collect() } else { Vec::new() },
+        }
+    }
+
+    #[inline(always)]
+    fn busy_slot(&self, key: u64) -> &AtomicU64 {
+        &self.busy[key as usize & (BUSY_SIZE - 1)]
+    }
+
+    /// 他のスレッドが局面 key を探索中か
+    #[inline(always)]
+    fn is_busy(&self, key: u64) -> bool {
+        self.busy_slot(key).load(Ordering::Relaxed) == key
+    }
+}
+
+/// 探索中の局面の表のエントリ数（2 の冪）
+const BUSY_SIZE: usize = 1 << 14;
+/// 残り深さがこれ以上の局面だけ探索中として登録する（浅い局面は登録・確認の手間の方が大きい）
+const BUSY_MIN_DEPTH: i32 = 3;
+
+/// 補助スレッドが飛ばす反復の深さ（Stockfish の Lazy SMP と同じ規則）。
+/// 補助スレッド i は ((深さ + PHASE) / SIZE) が奇数の深さを飛ばし、スレッドごとに別の深さを先に探索する。
+const SKIP_SIZE: [u32; 20] = [1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4];
+const SKIP_PHASE: [u32; 20] = [0, 1, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 7];
+
+/// 局面を探索中として登録し、Drop で登録を外す（ABDADA）
+struct BusyGuard<'a> {
+    slot: Option<(&'a AtomicU64, u64)>,
+}
+
+impl<'a> BusyGuard<'a> {
+    #[inline(always)]
+    fn new(shared: &'a Shared, key: u64, enable: bool) -> Self {
+        if !enable {
+            return BusyGuard { slot: None };
+        }
+        let slot = shared.busy_slot(key);
+        // 他のスレッドが同じ局面を登録済みなら、そのスレッドの登録を消さないよう何もしない
+        if slot.load(Ordering::Relaxed) == key {
+            return BusyGuard { slot: None };
+        }
+        slot.store(key, Ordering::Relaxed);
+        BusyGuard { slot: Some((slot, key)) }
+    }
+}
+
+impl Drop for BusyGuard<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if let Some((slot, key)) = self.slot {
+            // 別の局面に上書きされていたら消さない
+            let _ = slot.compare_exchange(key, 0, Ordering::Relaxed, Ordering::Relaxed);
+        }
+    }
+}
+
+/// 探索し終えずに後回しにした手（ABDADA）
+struct Deferred {
+    moves: [u8; 136],
+    len: usize,
+}
+
+impl Deferred {
+    #[inline(always)]
+    fn new() -> Self {
+        Deferred { moves: [0; 136], len: 0 }
+    }
+    #[inline(always)]
+    fn push(&mut self, mv: u8) {
+        self.moves[self.len] = mv;
+        self.len += 1;
+    }
+    #[inline(always)]
+    fn as_slice(&self) -> &[u8] {
+        &self.moves[..self.len]
+    }
 }
 
 struct Worker<'a> {
@@ -208,6 +303,8 @@ struct Worker<'a> {
     shared: &'a Shared,
     deadline: Option<Instant>,
     is_main: bool,
+    /// 複数スレッドで探索しているか（単一スレッドなら探索中の局面の登録を省く）
+    smp: bool,
     nodes: u64,
     stopped: bool,
     st: &'a mut ThreadState,
@@ -275,6 +372,39 @@ impl Worker<'_> {
         }
     }
 
+    /// 手 mv の子局面を PVS で探索する。first なら全幅、そうでなければヌルウィンドウで探索し、
+    /// 窓に入ったら全幅で探索し直す。lmr なら最初のヌルウィンドウ探索を 1 手浅くする。
+    /// defer が真で、他のスレッドがその子局面を探索中なら、探索せずに None を返す（呼び出し側で後回しにする）。
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn search_child(&mut self, b: &mut Board, mv: u8, depth: i32, alpha: i32, beta: i32, first: bool, lmr: bool, defer: bool) -> Option<i32> {
+        b.make(mv);
+        if defer && self.shared.is_busy(b.hash) {
+            b.undo();
+            return None;
+        }
+        let s = if first {
+            -self.alphabeta(b, depth - 1, -beta, -alpha, true)
+        } else {
+            let mut s = if lmr {
+                let s = -self.alphabeta(b, depth - 2, -alpha - 1, -alpha, true);
+                if s > alpha {
+                    -self.alphabeta(b, depth - 1, -alpha - 1, -alpha, true)
+                } else {
+                    s
+                }
+            } else {
+                -self.alphabeta(b, depth - 1, -alpha - 1, -alpha, true)
+            };
+            if alpha < s && s < beta {
+                s = -self.alphabeta(b, depth - 1, -beta, -alpha, true);
+            }
+            s
+        };
+        b.undo();
+        Some(s)
+    }
+
     fn alphabeta(&mut self, b: &mut Board, depth: i32, mut alpha: i32, mut beta: i32, null_ok: bool) -> i32 {
         self.nodes += 1;
         if self.nodes & 1023 == 0 {
@@ -336,6 +466,12 @@ impl Worker<'_> {
             }
         }
 
+        // 置換表・ヌルムーブで戻らず、実際に手を読む局面だけを探索中として登録する（ABDADA）。
+        // 共有の表への書き込みは他のコアのキャッシュを無効にするので、すぐ戻る局面では行わない。
+        // 登録はこの関数から戻るときに BusyGuard の Drop で外れる。
+        let shared = self.shared;
+        let _busy = BusyGuard::new(shared, key, self.smp && depth >= BUSY_MIN_DEPTH);
+
         let mut best = -INF;
         let mut best_mv = NO_MOVE;
 
@@ -357,25 +493,30 @@ impl Worker<'_> {
                 return best;
             }};
         }
+        // 子局面の値 s で最善手・窓を更新し、β カットなら戻る
+        macro_rules! update {
+            ($s:expr, $mv:expr, $killer:expr) => {{
+                let s = $s;
+                if self.stopped {
+                    return 0;
+                }
+                if s > best {
+                    best = s;
+                    best_mv = $mv;
+                }
+                if s > alpha {
+                    alpha = s;
+                }
+                if alpha >= beta {
+                    cutoff!($mv, $killer);
+                }
+            }};
+        }
 
         // フェーズ 1: 置換表の手（フルウィンドウ）
         if tt_move != NO_MOVE {
-            b.make(tt_move);
-            let s = -self.alphabeta(b, depth - 1, -beta, -alpha, true);
-            b.undo();
-            if self.stopped {
-                return 0;
-            }
-            if s > best {
-                best = s;
-                best_mv = tt_move;
-            }
-            if s > alpha {
-                alpha = s;
-            }
-            if alpha >= beta {
-                cutoff!(tt_move, false);
-            }
+            let s = self.search_child(b, tt_move, depth, alpha, beta, true, false, false).unwrap();
+            update!(s, tt_move, false);
         }
 
         // フェーズ 2: 移動手（PVS + LMR）
@@ -406,41 +547,19 @@ impl Worker<'_> {
         #[cfg(feature = "stats")]
         crate::stats::counters::CYC_PAWNGEN.fetch_add(unsafe { core::arch::x86_64::_rdtsc() } - __t, Ordering::Relaxed);
 
-        let mut is_first = true;
+        // 複数スレッドのとき、他のスレッドが探索中の子局面は後回しにする（最初の手は後回しにしない）
+        let can_defer = self.smp && depth - 1 >= BUSY_MIN_DEPTH;
+        let mut deferred = Deferred::new();
+        // 置換表の手を全幅で読んだ後は、残りの手はすべてヌルウィンドウで読む（PVS）
+        let mut is_first = tt_move == NO_MOVE;
         for (i, mv) in pawns.moves().enumerate() {
-            b.make(mv);
-            let s = if is_first {
-                is_first = false;
-                -self.alphabeta(b, depth - 1, -beta, -alpha, true)
-            } else if i >= 3 && depth >= 3 {
-                let mut s = -self.alphabeta(b, depth - 2, -alpha - 1, -alpha, true);
-                if s > alpha {
-                    s = -self.alphabeta(b, depth - 1, -alpha - 1, -alpha, true);
-                    if alpha < s && s < beta {
-                        s = -self.alphabeta(b, depth - 1, -beta, -alpha, true);
-                    }
+            let lmr = i >= 3 && depth >= 3;
+            match self.search_child(b, mv, depth, alpha, beta, is_first, lmr, can_defer && !is_first) {
+                Some(s) => {
+                    is_first = false;
+                    update!(s, mv, true);
                 }
-                s
-            } else {
-                let mut s = -self.alphabeta(b, depth - 1, -alpha - 1, -alpha, true);
-                if alpha < s && s < beta {
-                    s = -self.alphabeta(b, depth - 1, -beta, -alpha, true);
-                }
-                s
-            };
-            b.undo();
-            if self.stopped {
-                return 0;
-            }
-            if s > best {
-                best = s;
-                best_mv = mv;
-            }
-            if s > alpha {
-                alpha = s;
-            }
-            if alpha >= beta {
-                cutoff!(mv, true);
+                None => deferred.push(mv),
             }
         }
 
@@ -453,7 +572,9 @@ impl Worker<'_> {
         if pawn_mask == 0 && hm | vm == 0 {
             return self.evaluate(b);
         }
-        if tt_move >= HWALL_BASE {
+        // 置換表の手（フェーズ 1 で探索済み）が壁なら候補から外す。NO_MOVE（255）は壁の番号の範囲外なので除く
+        // （除かないと 1 << 110 になり、リリースビルドではシフト量が 46 に丸められて垂直壁 (6,5) が消えていた）
+        if tt_move != NO_MOVE && tt_move >= HWALL_BASE {
             if tt_move < VWALL_BASE {
                 hm &= !(1u64 << (tt_move - HWALL_BASE));
             } else {
@@ -493,32 +614,20 @@ impl Worker<'_> {
             crate::stats::counters::CYC_ORDER.fetch_add(unsafe { core::arch::x86_64::_rdtsc() } - __t, Ordering::Relaxed);
 
             for mv in walls.moves() {
-                b.make(mv);
-                let s = if is_first {
-                    is_first = false;
-                    -self.alphabeta(b, depth - 1, -beta, -alpha, true)
-                } else {
-                    let mut s = -self.alphabeta(b, depth - 1, -alpha - 1, -alpha, true);
-                    if alpha < s && s < beta {
-                        s = -self.alphabeta(b, depth - 1, -beta, -alpha, true);
+                match self.search_child(b, mv, depth, alpha, beta, is_first, false, can_defer && !is_first) {
+                    Some(s) => {
+                        is_first = false;
+                        update!(s, mv, true);
                     }
-                    s
-                };
-                b.undo();
-                if self.stopped {
-                    return 0;
-                }
-                if s > best {
-                    best = s;
-                    best_mv = mv;
-                }
-                if s > alpha {
-                    alpha = s;
-                }
-                if alpha >= beta {
-                    cutoff!(mv, true);
+                    None => deferred.push(mv),
                 }
             }
+        }
+
+        // 後回しにした手（その間に他のスレッドが置換表を埋めているので、多くは置換表で即座に返る）
+        for &mv in deferred.as_slice() {
+            let s = self.search_child(b, mv, depth, alpha, beta, false, false, false).unwrap();
+            update!(s, mv, true);
         }
 
         let flag = if best <= orig_alpha {
@@ -580,21 +689,33 @@ impl Worker<'_> {
         out
     }
 
-    /// 反復深化（Python 版 best_move）。戻り値: (最善手, 評価値, 完了した深さ)
-    fn iterate(&mut self, b: &mut Board, moves: &[u8], cuts: [(u64, u64); 2], max_depth: u32, lead: u32) -> (u8, i32, u32) {
+    /// 反復深化（Python 版 best_move）。idx はスレッド番号（0 = 主スレッド）。
+    /// 戻り値: (最善手, 評価値, 完了した深さ)
+    fn iterate(&mut self, b: &mut Board, moves: &[u8], cuts: [(u64, u64); 2], max_depth: u32, idx: usize) -> (u8, i32, u32) {
         let mut best_mv = NO_MOVE;
         let mut prev_score = 0;
         let mut completed = 0;
-        for iter_d in 1..=max_depth {
-            // 補助スレッドは 1 手先の深さを探索して置換表を先に埋める
-            let d = (iter_d + lead).min(max_depth.max(iter_d)) as i32;
+        for d in 1..=max_depth {
+            // 補助スレッドは深さを飛ばしながら進み、主スレッドより先の深さで置換表を埋める（最大深さは飛ばさない）
+            if idx > 0 && d < max_depth {
+                let i = (idx - 1) % SKIP_SIZE.len();
+                if ((d + SKIP_PHASE[i]) / SKIP_SIZE[i]) % 2 != 0 {
+                    continue;
+                }
+            }
+            let d = d as i32;
+            let can_defer = self.smp && d - 1 >= BUSY_MIN_DEPTH;
             let orig_alpha = (prev_score - ASPIRATION_WINDOW).max(-INF);
             let orig_beta = (prev_score + ASPIRATION_WINDOW).min(INF);
             let (mut alpha, mut beta) = (orig_alpha, orig_beta);
             let mut window = ASPIRATION_WINDOW;
             let mut retries = 0;
+            // 窓を超えた手（探索し直すときに先頭に置く）
+            let mut fail_high_mv = NO_MOVE;
             let (best_score, current_best) = loop {
-                let tt_move = if best_mv != NO_MOVE {
+                let tt_move = if fail_high_mv != NO_MOVE {
+                    fail_high_mv
+                } else if best_mv != NO_MOVE {
                     best_mv
                 } else {
                     self.tt.probe(b.hash).map_or(NO_MOVE, |e| e.mv)
@@ -604,28 +725,38 @@ impl Worker<'_> {
                 let mut current_best = NO_MOVE;
                 let loop_alpha = alpha;
                 let mut is_first = true;
-                for mv in ordered.moves() {
-                    b.make(mv);
-                    let s = if is_first {
-                        is_first = false;
-                        -self.alphabeta(b, d - 1, -beta, -alpha, true)
-                    } else {
-                        let mut s = -self.alphabeta(b, d - 1, -alpha - 1, -alpha, true);
-                        if alpha < s && s < beta {
-                            s = -self.alphabeta(b, d - 1, -beta, -alpha, true);
+                let mut deferred = Deferred::new();
+                'moves: {
+                    // 子局面の値 s で最善手・窓を更新する。停止したとき・窓を超えたときは残りを探索しない
+                    macro_rules! update {
+                        ($s:expr, $mv:expr) => {{
+                            let s = $s;
+                            if self.stopped {
+                                break 'moves;
+                            }
+                            if s > best_score {
+                                best_score = s;
+                                current_best = $mv;
+                            }
+                            if s > alpha {
+                                alpha = s;
+                            }
+                            if alpha >= beta {
+                                break 'moves;
+                            }
+                        }};
+                    }
+                    for mv in ordered.moves() {
+                        match self.search_child(b, mv, d, alpha, beta, is_first, false, can_defer && !is_first) {
+                            Some(s) => {
+                                is_first = false;
+                                update!(s, mv);
+                            }
+                            None => deferred.push(mv),
                         }
-                        s
-                    };
-                    b.undo();
-                    if self.stopped {
-                        break;
                     }
-                    if s > best_score {
-                        best_score = s;
-                        current_best = mv;
-                    }
-                    if s > alpha {
-                        alpha = s;
+                    for &mv in deferred.as_slice() {
+                        update!(self.search_child(b, mv, d, alpha, beta, false, false, false).unwrap(), mv);
                     }
                 }
                 if self.stopped {
@@ -635,6 +766,9 @@ impl Worker<'_> {
                 let fail_high = best_score >= beta;
                 if !(fail_low || fail_high) {
                     break (best_score, current_best);
+                }
+                if fail_high {
+                    fail_high_mv = current_best;
                 }
                 retries += 1;
                 if retries > MAX_RETRIES {
@@ -689,8 +823,13 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { max_depth: 4, time: None, threads: 1 }
+        Limits { max_depth: 4, time: None, threads: default_threads() }
     }
+}
+
+/// 既定のスレッド数（CPU の論理スレッド数）
+pub fn default_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
 #[derive(Clone, Debug)]
@@ -706,25 +845,136 @@ pub struct SearchResult {
     pub elapsed: Duration,
 }
 
+/// 補助スレッドに渡す探索の依頼
+struct Job {
+    /// 探索の通し番号。完了の知らせに付けて返させ、前の探索の知らせと区別する
+    id: u64,
+    root: Board,
+    moves: Arc<[u8]>,
+    cuts: [(u64, u64); 2],
+    max_depth: u32,
+    tt: Arc<Tt>,
+    gen: u8,
+    shared: Arc<Shared>,
+}
+
+/// 常駐する補助スレッド。探索のたびにスレッドを作ると、短い探索ではその時間の方が長くなるため、
+/// 作ったスレッドを Searcher が持ち続け、依頼を送って起こす（待っている間は CPU を使わない）。
+struct Helper {
+    /// Drop で先に閉じてスレッドのループを終わらせるため Option にしている
+    jobs: Option<mpsc::Sender<Job>>,
+    /// 探索が終わると (探索の通し番号, ノード数) が届く
+    done: mpsc::Receiver<(u64, u64)>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Helper {
+    /// idx はスレッド番号（1 から。反復の深さの飛ばし方を決める）
+    fn spawn(idx: usize) -> Helper {
+        let (jobs, rx) = mpsc::channel::<Job>();
+        let (done_tx, done) = mpsc::channel::<(u64, u64)>();
+        let handle = std::thread::Builder::new()
+            .name(format!("search-helper-{idx}"))
+            .spawn(move || helper_loop(idx, rx, done_tx))
+            .expect("failed to spawn a search helper thread");
+        Helper { jobs: Some(jobs), done, handle: Some(handle) }
+    }
+
+    /// スレッドが終了しているか（探索中のパニックでしか終了しない）
+    fn is_dead(&self) -> bool {
+        self.handle.as_ref().map_or(true, |h| h.is_finished())
+    }
+
+    fn send(&self, job: Job) {
+        self.jobs.as_ref().unwrap().send(job).expect("search helper thread panicked");
+    }
+
+    /// 通し番号 id の探索が終わるのを待ち、ノード数を返す。
+    /// 前の探索の知らせ（主スレッドがパニックして待たなかった分）が残っていたら読み捨てる。
+    fn wait(&self, id: u64) -> u64 {
+        loop {
+            let (done_id, nodes) = self.done.recv().expect("search helper thread panicked");
+            if done_id == id {
+                return nodes;
+            }
+        }
+    }
+}
+
+impl Drop for Helper {
+    fn drop(&mut self) {
+        // 送信側を閉じるとスレッドのループが終わるので、それを待つ
+        self.jobs.take();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// 戻るとき（パニックで巻き戻るときも）に停止フラグを立てる。
+/// 補助スレッドは時間制限を見ないので、立てずに Helper の Drop（join）に進むと待ち続けてしまう。
+struct StopOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for StopOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// 補助スレッドの本体: 依頼が来るたびに探索し、ノード数を返す
+fn helper_loop(idx: usize, jobs: mpsc::Receiver<Job>, done: mpsc::Sender<(u64, u64)>) {
+    let mut st = ThreadState::new();
+    let mut last_gen = 0u8;
+    while let Ok(job) = jobs.recv() {
+        // 世代が進んだ回数だけ history を半減する（使われなかった探索の分も含める）
+        let shift = u32::from(job.gen.wrapping_sub(last_gen)).min(31);
+        last_gen = job.gen;
+        for h in st.history.iter_mut() {
+            *h >>= shift;
+        }
+        let mut b = job.root;
+        let mut w = Worker {
+            tt: &*job.tt,
+            gen: job.gen,
+            shared: &*job.shared,
+            deadline: None,
+            is_main: false,
+            smp: true,
+            nodes: 0,
+            stopped: false,
+            st: &mut st,
+        };
+        w.iterate(&mut b, &*job.moves, job.cuts, job.max_depth, idx);
+        let nodes = w.nodes;
+        if done.send((job.id, nodes)).is_err() {
+            break;
+        }
+    }
+}
+
 /// 置換表・キラー手・history を対局を通して持ち越す探索器
 pub struct Searcher {
     tt: Arc<Tt>,
     gen: u8,
-    states: Vec<ThreadState>,
+    /// 主スレッド（search を呼んだスレッド）の状態
+    main: ThreadState,
+    /// 常駐する補助スレッド（必要な数まで増やす）
+    helpers: Vec<Helper>,
+    /// 探索の通し番号（補助スレッドの完了の知らせを区別する）
+    search_id: u64,
 }
 
 impl Searcher {
     pub fn new(tt_mb: usize) -> Self {
-        Searcher { tt: Arc::new(Tt::new(tt_mb)), gen: 0, states: vec![ThreadState::new()] }
+        Searcher { tt: Arc::new(Tt::new(tt_mb)), gen: 0, main: ThreadState::new(), helpers: Vec::new(), search_id: 0 }
     }
 
-    /// 置換表・キラー手・history を消す（Python 版 clear_tt）
+    /// 置換表・キラー手・history を消す（Python 版 clear_tt）。補助スレッドは終了させ、次の探索で作り直す。
     pub fn clear(&mut self) {
         self.tt.clear();
         self.gen = 0;
-        for s in &mut self.states {
-            *s = ThreadState::new();
-        }
+        self.main = ThreadState::new();
+        self.helpers.clear();
     }
 
     pub fn search(&mut self, board: &Board, limits: &Limits) -> SearchResult {
@@ -762,45 +1012,54 @@ impl Searcher {
             return done(Some(moves[0]));
         }
 
-        // 新しい世代（Python 版 _new_generation: history を半減）
+        // 新しい世代（Python 版 _new_generation: history を半減。補助スレッドは依頼を受けたときに半減する）
         self.gen = self.gen.wrapping_add(1);
-        let threads = limits.threads.max(1);
-        while self.states.len() < threads {
-            self.states.push(ThreadState::new());
+        for h in self.main.history.iter_mut() {
+            *h >>= 1;
         }
-        for s in &mut self.states {
-            for h in s.history.iter_mut() {
-                *h >>= 1;
+        let threads = limits.threads.max(1);
+        let n_helpers = threads - 1;
+        // パニックで終了した補助スレッドは作り直す（catch_unwind で Searcher を使い回した場合）
+        let alive = n_helpers.min(self.helpers.len());
+        for (i, h) in self.helpers[..alive].iter_mut().enumerate() {
+            if h.is_dead() {
+                *h = Helper::spawn(i + 1);
             }
         }
+        while self.helpers.len() < n_helpers {
+            self.helpers.push(Helper::spawn(self.helpers.len() + 1));
+        }
+        self.search_id += 1;
+        let id = self.search_id;
 
-        let shared = Shared { stop: AtomicBool::new(false), best: Mutex::new((0, NO_MOVE, 0)) };
+        let smp = threads > 1;
+        let shared = Arc::new(Shared::new(smp));
+        let _stop = StopOnDrop(&shared.stop);
         // 桁あふれするほど長い時間は制限なしとみなす
         let deadline = limits.time.and_then(|t| start.checked_add(t));
         let max_depth = limits.max_depth.clamp(1, MAX_DEPTH as u32 - 2);
-        let (tt, gen) = (&*self.tt, self.gen);
-        let (main_state, helper_states) = self.states[..threads].split_first_mut().unwrap();
+        let (tt, gen) = (Arc::clone(&self.tt), self.gen);
+        let moves: Arc<[u8]> = moves.into();
 
-        let nodes = std::thread::scope(|s| {
-            let handles: Vec<_> = helper_states
-                .iter_mut()
-                .enumerate()
-                .map(|(i, st)| {
-                    let mut b = root.clone();
-                    let (shared, moves) = (&shared, &moves);
-                    s.spawn(move || {
-                        let mut w = Worker { tt, gen, shared, deadline: None, is_main: false, nodes: 0, stopped: false, st };
-                        // 半数の補助スレッドは 1 つ深い深さを先に探索する
-                        w.iterate(&mut b, moves, cuts, max_depth, (i as u32 + 1) & 1);
-                        w.nodes
-                    })
-                })
-                .collect();
-            let mut w = Worker { tt, gen, shared: &shared, deadline, is_main: true, nodes: 0, stopped: false, st: main_state };
-            crate::timed!(CYC_TOTAL, w.iterate(&mut root, &moves, cuts, max_depth, 0));
-            shared.stop.store(true, Ordering::Relaxed);
-            w.nodes + handles.into_iter().map(|h| h.join().unwrap()).sum::<u64>()
-        });
+        for h in &self.helpers[..n_helpers] {
+            h.send(Job {
+                id,
+                root: root.clone(),
+                moves: Arc::clone(&moves),
+                cuts,
+                max_depth,
+                tt: Arc::clone(&tt),
+                gen,
+                shared: Arc::clone(&shared),
+            });
+        }
+        let mut w =
+            Worker { tt: &*tt, gen, shared: &*shared, deadline, is_main: true, smp, nodes: 0, stopped: false, st: &mut self.main };
+        crate::timed!(CYC_TOTAL, w.iterate(&mut root, &*moves, cuts, max_depth, 0));
+        let main_nodes = w.nodes;
+        // 補助スレッドを止めて、全員が探索を終えるのを待つ（次の探索までに置換表などへの書き込みを終わらせる）
+        shared.stop.store(true, Ordering::Relaxed);
+        let nodes = main_nodes + self.helpers[..n_helpers].iter().map(|h| h.wait(id)).sum::<u64>();
 
         let (depth, mv, score) = *shared.best.lock().unwrap();
         // 深さ 1 も終わらないうちに時間切れになった場合は候補の先頭を返す
@@ -867,8 +1126,59 @@ mod tests {
         for _ in 0..3 {
             s.search(&b, &lim);
         }
-        let max = s.states[0].history.iter().copied().max().unwrap();
+        let max = s.main.history.iter().copied().max().unwrap();
         assert!(max <= HISTORY_MAX, "{max}");
+    }
+
+    #[test]
+    fn many_threads_search() {
+        // 論理スレッド数より多くても、深さを飛ばす補助スレッド・後回し（ABDADA）を通って最大深さまで探索する
+        let mut b = Board::new();
+        for a in [13, 67, 22, 58] {
+            b.make(a);
+        }
+        let mut s = Searcher::new(16);
+        for threads in [2, 16, 24, 4] {
+            let r = s.search(&b, &Limits { max_depth: 8, time: None, threads });
+            assert!(b.is_legal(r.best.unwrap()) && r.depth == 8, "{threads}: {r:?}");
+        }
+        // 補助スレッドは常駐して使い回す（減らしても終了させない）
+        assert_eq!(s.helpers.len(), 23);
+        // clear で終了させ、次の探索で作り直す
+        s.clear();
+        assert!(s.helpers.is_empty());
+        let r = s.search(&b, &Limits { max_depth: 6, time: Some(Duration::from_millis(500)), threads: 3 });
+        assert!(b.is_legal(r.best.unwrap()) && s.helpers.len() == 2);
+    }
+
+    #[test]
+    fn recovers_after_abandoned_search() {
+        let b = Board::new();
+        let mut s = Searcher::new(4);
+        let lim = Limits { max_depth: 5, time: None, threads: 3 };
+        assert!(b.is_legal(s.search(&b, &lim).best.unwrap()));
+        // 主スレッドがパニックして完了を待たなかった状態: 依頼を送ったまま、完了の知らせを読まずに残す
+        let shared = Arc::new(Shared::new(true));
+        shared.stop.store(true, Ordering::Relaxed);
+        s.helpers[0].send(Job {
+            id: s.search_id,
+            root: b.clone(),
+            moves: Arc::from(b.legal_actions().as_slice()),
+            cuts: [(0, 0); 2],
+            max_depth: 5,
+            tt: Arc::clone(&s.tt),
+            gen: s.gen,
+            shared,
+        });
+        // 補助スレッドがパニックで終了した状態
+        let h = &mut s.helpers[1];
+        h.jobs.take();
+        h.handle.take().unwrap().join().unwrap();
+        assert!(s.helpers[1].is_dead());
+        // 次の探索は、残った知らせを読み捨て、終了したスレッドを作り直して最後まで探索する
+        let r = s.search(&b, &lim);
+        assert!(b.is_legal(r.best.unwrap()) && r.depth == 5, "{r:?}");
+        assert!(!s.helpers[1].is_dead(), "終了した補助スレッドが作り直されていない");
     }
 
     #[test]

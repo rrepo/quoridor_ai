@@ -54,8 +54,9 @@ b.undo_move()
 b.legal_actions(); b.legal_moves(); b.count_legal_actions(); b.action_mask(); b.to_planes()
 b.shortest_path(0); b.shortest_path_nodes(1); b.winner(); b.is_terminal(); b.repetitions()
 
-mv, score, depth, nodes = b.search(depth=6)                 # 深さ指定
-mv, score, depth, nodes = b.search(time_ms=200, threads=8)  # 時間制限 + 並列
+mv, score, depth, nodes = b.search(depth=6)                 # 深さ指定（既定で全論理スレッドを使う）
+mv, score, depth, nodes = b.search(time_ms=200, threads=8)  # 時間制限 + スレッド数指定
+mv, score, depth, nodes = b.search(depth=6, threads=1)      # 単一スレッド（結果が毎回同じ）
 q.clear_search()                                            # 置換表などを消す（対局の開始時）
 
 b.perft(4, bulk=True, threads=8)
@@ -74,7 +75,7 @@ src/
   path.rs     ビットボード BFS
   zobrist.rs  Zobrist ハッシュ
   eval.rs     評価関数・壁の手順付け用スコア
-  search.rs   αβ 探索（Lazy SMP・時間制限）・並列 perft
+  search.rs   αβ 探索（Lazy SMP + ABDADA・常駐スレッド・時間制限）・並列 perft
   tt.rs       置換表（ロックなし・スレッド共有）
   capi.rs     Python 拡張モジュール（CPython の安定 ABI を直接呼ぶ）
   stats.rs    計測用カウンタ（--features stats）
@@ -94,6 +95,14 @@ legacy/         Python 版（参照用）と、Rust 版との突き合わせス�
 - 各プレイヤーの「ゴールへ通じる経路」を make/undo で差分管理し、その経路を切る壁だけ BFS で確認する。
 - 探索: 置換表はロックなし（key ^ data 方式）で全スレッドが共有。どのスレッドでも最も深く探索し終えた結果を採用する。
   最短距離と最短経路の切断マスクはスレッドごとの小さなキャッシュ（64KB 程度）で使い回す。
+- 並列化（Lazy SMP）: 補助スレッドは反復の深さをスレッドごとにずらし（Stockfish と同じ規則）、
+  他のスレッドが探索中の子局面は後回しにする（ABDADA）。補助スレッドは `Searcher` が常駐させて使い回す。
+
+### スレッド数の既定値
+
+`search` と `perft` のスレッド数の既定値は CPU の論理スレッド数（CLI の `--threads`、Python の `threads=None`）。
+`bench` と `selfplay` の既定は 1。複数スレッドの探索は実行ごとに結果（最善手・ノード数）が変わりうるので、
+再現性が必要なとき、または複数のプロセスで並行して探索するときは `threads=1` を指定する。
 
 ### Python 版からの変更点（探索）
 
@@ -108,9 +117,12 @@ legacy/         Python 版（参照用）と、Rust 版との突き合わせス�
 |---|---|---|
 | 全合法手の生成（実戦局面の平均） | 53 µs | 0.2 µs |
 | perft(4) 初期局面（247,569,030、bulk） | — | 0.14 s（1 スレッド） |
-| 探索速度 | 約 5 万ノード/秒 | 約 700 万ノード/秒（1 スレッド） |
-| 深さ 10 の探索（中盤局面） | — | 5.6 s（1 スレッド）/ 2.2 s（8 スレッド） |
+| 探索速度 | 約 5 万ノード/秒 | 約 700 万ノード/秒（1 スレッド）/ 約 7,000 万ノード/秒（16 スレッドの合計） |
+| 同じ深さに届くまでの時間（5 局面の合計、深さ 11〜12） | — | 10.9 s（1 スレッド）/ 3.0 s（8 スレッド、3.6 倍）/ 2.3 s（16 スレッド、4.8 倍） |
 | 同じ思考時間での対局 | Python 深さ 4 | Rust 1 手 25 ms で 83% 勝ち（思考時間は約 1/3） |
+
+並列化を改める前（全スレッドがほぼ同じ木を同じ順番で読んでいた版）は、同じ深さに届くまでの時間が
+8 スレッドで 1.75 倍、16 スレッドで 1.74 倍にとどまっていた。
 
 ## Smart App Control について
 
@@ -118,6 +130,8 @@ legacy/         Python 版（参照用）と、Rust 版との突き合わせス�
 ブロックされることがある。そのため PyO3 は使わず、CPython の安定 ABI を直接呼ぶ実装にしている（`src/capi.rs`）。
 関数はインポート時に読み込み済みの `python3XX.dll` から取得するので、import ライブラリもビルドスクリプトも不要。
 作り直した実行ファイルや `.pyd` が将来ブロックされる可能性はある（判定はファイルごと）。
+実際に、リリースビルドのライブラリのテスト用実行ファイル（`cargo test --release --lib`）がブロックされたことがある。
+その場合はデバッグビルドで `cargo test --lib` を実行する（整数のあふれも検出できる）。
 
 ## PGO（プロファイルに基づく最適化）
 

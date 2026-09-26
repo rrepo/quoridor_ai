@@ -15,7 +15,7 @@ use std::ptr::{self, null, null_mut};
 
 use crate::board::{decode_action, encode_move as encode, Board, Move};
 use crate::consts::{ACTION_COUNT, HWALL_BASE, MAX_WALLS, VWALL_BASE};
-use crate::search::{perft_parallel, Limits, Searcher};
+use crate::search::{default_threads, perft_parallel, Limits, Searcher};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -610,7 +610,7 @@ unsafe extern "C" fn m_repetitions(o: Obj, _: Obj) -> Obj {
     py_int(board(o).repetitions() as i64)
 }
 
-/// perft(depth, bulk=False)。計算中は GIL を解放する。
+/// perft(depth, bulk=False, threads=None)。計算中は GIL を解放する。
 unsafe extern "C" fn m_perft(o: Obj, args: *const Obj, nargs: Ssize, kw: Obj) -> Obj {
     let Some(d) = arg(args, nargs, kw, 0, "depth") else {
         return raise(api().exc_type_error, "perft() missing argument: depth");
@@ -621,8 +621,8 @@ unsafe extern "C" fn m_perft(o: Obj, args: *const Obj, nargs: Ssize, kw: Obj) ->
         None => return raise(api().exc_type_error, "depth must be an int"),
     };
     let Some(bulk) = bool_arg(arg(args, nargs, kw, 1, "bulk"), false) else { return null_mut() };
-    let threads = match arg(args, nargs, kw, 2, "threads") {
-        None => 1,
+    let threads = match arg(args, nargs, kw, 2, "threads").filter(|&t| t != api().none) {
+        None => default_threads(),
         Some(t) => match int_of(t) {
             Some(v @ 1..=256) => v as usize,
             _ => return raise(api().exc_value_error, "threads must be 1..256"),
@@ -635,11 +635,13 @@ unsafe extern "C" fn m_perft(o: Obj, args: *const Obj, nargs: Ssize, kw: Obj) ->
     (api().PyLong_FromUnsignedLongLong)(n)
 }
 
-/// search(depth=4, time_ms=None, threads=1) -> (最善手 or None, 評価値, 完了した深さ, ノード数)
+/// search(depth=4, time_ms=None, threads=None) -> (最善手 or None, 評価値, 完了した深さ, ノード数)
+///
+/// threads=None なら CPU の論理スレッド数で探索する。
 unsafe extern "C" fn m_search(o: Obj, args: *const Obj, nargs: Ssize, kw: Obj) -> Obj {
     let depth_arg = arg(args, nargs, kw, 0, "depth");
     let time_arg = arg(args, nargs, kw, 1, "time_ms").filter(|&t| t != api().none);
-    let mut lim = Limits { max_depth: 4, time: None, threads: 1 };
+    let mut lim = Limits { max_depth: 4, time: None, threads: default_threads() };
     if let Some(d) = depth_arg {
         match int_of(d) {
             Some(v @ 1..=60) => lim.max_depth = v as u32,
@@ -658,7 +660,7 @@ unsafe extern "C" fn m_search(o: Obj, args: *const Obj, nargs: Ssize, kw: Obj) -
             lim.max_depth = 60;
         }
     }
-    if let Some(t) = arg(args, nargs, kw, 2, "threads") {
+    if let Some(t) = arg(args, nargs, kw, 2, "threads").filter(|&t| t != api().none) {
         match int_of(t) {
             Some(v @ 1..=256) => lim.threads = v as usize,
             _ => return raise(api().exc_value_error, "threads must be 1..256"),
@@ -879,8 +881,8 @@ static METHODS: [PyMethodDef; 25] = [
     meth!("winner", m_winner as NoArgs, METH_NOARGS, "勝者（0 / 1）。終局していなければ None。"),
     meth!("is_terminal", m_is_terminal as NoArgs, METH_NOARGS, "(終局したか, 勝者 or -1)。"),
     meth!("repetitions", m_repetitions as NoArgs, METH_NOARGS, "現在の局面がこれまでの手で何回現れたか（初期局面は数えない）。"),
-    meth!("perft", m_perft as FastKw, FK, "perft(depth, bulk=False, threads=1)\n--\n\n深さ depth の葉の数。計算中は GIL を解放する。"),
-    meth!("search", m_search as FastKw, FK, "search(depth=4, time_ms=None, threads=1)\n--\n\nαβ 探索で最善手を返す: (手 or None, 評価値, 完了した深さ, ノード数)。置換表は呼び出し間で持ち越す。"),
+    meth!("perft", m_perft as FastKw, FK, "perft(depth, bulk=False, threads=None)\n--\n\n深さ depth の葉の数。threads=None なら CPU の論理スレッド数。計算中は GIL を解放する。"),
+    meth!("search", m_search as FastKw, FK, "search(depth=4, time_ms=None, threads=None)\n--\n\nαβ 探索で最善手を返す: (手 or None, 評価値, 完了した深さ, ノード数)。threads=None なら CPU の論理スレッド数で探索する。置換表は呼び出し間で持ち越す。"),
     meth!("to_planes", m_to_planes as NoArgs, METH_NOARGS, "(4, 9, 9) float32 の bytes。np.frombuffer(p, np.float32).reshape(4, 9, 9)。"),
     meth!("clone", m_clone as NoArgs, METH_NOARGS, "盤面を複製する。"),
     meth!("__copy__", m_clone as NoArgs, METH_NOARGS, ""),

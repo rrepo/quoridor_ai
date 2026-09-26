@@ -1,7 +1,8 @@
 //! コマンドライン: cargo run --release --bin quoridor -- <サブコマンド>
 //!
 //!   perft <深さ> [--threads N] [--bulk]
-//!   search [--depth D] [--time MS] [--threads N] [手 ...]
+//!   search [--depth D] [--time MS] [--threads N] [--tt MB] [手 ...]
+//!   （perft・search の --threads の既定は CPU の論理スレッド数。bench・selfplay は 1）
 //!   selfplay [--games N] [--jobs J] [--openings K] [--seed S] [--a 設定] [--b 設定]
 //!   bench [--depth D] [--threads N]
 //!
@@ -12,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use quoridor_rs::{decode_action, encode_move, perft_parallel, Board, Limits, Move, Searcher};
+use quoridor_rs::{decode_action, default_threads, encode_move, perft_parallel, Board, Limits, Move, Searcher};
 
 fn usage() -> ! {
     eprintln!(
@@ -116,7 +117,7 @@ fn parse_limits(spec: &str) -> Limits {
 
 fn cmd_perft(a: &Args) {
     let depth: u32 = a.rest.first().and_then(|s| s.parse().ok()).unwrap_or_else(|| usage());
-    let threads = a.get("threads").unwrap_or(1);
+    let threads = a.get("threads").unwrap_or_else(default_threads);
     let b = board_from(&a.rest[1..]);
     let t = Instant::now();
     let n = perft_parallel(&b, depth, threads, a.has("bulk"));
@@ -125,7 +126,8 @@ fn cmd_perft(a: &Args) {
 }
 
 fn cmd_search(a: &Args) {
-    let mut lim = Limits { max_depth: a.get("depth").unwrap_or(4), time: None, threads: a.get("threads").unwrap_or(1) };
+    let mut lim =
+        Limits { max_depth: a.get("depth").unwrap_or(4), time: None, threads: a.get("threads").unwrap_or_else(default_threads) };
     if let Some(ms) = a.get::<u64>("time") {
         lim.time = Some(Duration::from_millis(ms));
         if a.get::<u32>("depth").is_none() {
