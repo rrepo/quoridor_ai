@@ -1,0 +1,19 @@
+[package]
+name = "quoridor_rs"
+version = "0.1.0"
+edition = "2021"
+description = "Quoridor rules engine and alpha-beta search (bitboard), with a CLI and a Python extension"
+
+[lib]
+name = "quoridor_rs"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# 計測用カウンタ（src/stats.rs）
+stats = []
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
